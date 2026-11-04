@@ -86,6 +86,109 @@ fn sample_dir(img: &Image, d: V3) -> [f32; 4] {
     sample_wrap(img, (lon / TAU + 0.5) * img.w as f64, (0.5 - lat / PI) * img.h as f64)
 }
 
+/// Widest view [`view_dir`] draws, degrees (a whole turn would put the antipode on every edge).
+pub const MAX_VIEW_FOV: f64 = 359.0;
+
+/// The direction seen at a point of a flat view of the sphere, looking down +Z with +Y up: `x`
+/// runs −1…1 across the view's width, `y` (up) is scaled the same (−h/w…h/w), `fov` is the
+/// horizontal field of view in degrees (1…[`MAX_VIEW_FOV`]).
+///
+/// Up to 90° this is a rectilinear (pinhole) view. From there to 180° it eases into the
+/// stereographic projection, which reaches the whole sphere but its antipode, so the view keeps
+/// zooming out without running off the picture: pointed at the nadir that is a "little planet"
+/// (outside in), at the zenith a "rabbit hole" (inside out). Both ends and the blend are the
+/// general perspective projection from a point `d` behind the centre of the sphere (`d` = 0:
+/// rectilinear, 1: stereographic): ρ = (d + 1) sin θ / (d + cos θ). `None` past the sphere.
+pub fn view_dir(x: f64, y: f64, fov: f64) -> Option<[f64; 3]> {
+    if !(x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    let fov = if fov.is_finite() { fov.clamp(1.0, MAX_VIEW_FOV) } else { 90.0 };
+    let half = (fov * 0.5).to_radians();
+    let d = f64::from(smoothstep(90.0, 180.0, fov as f32));
+    let k = d + 1.0;
+    let denom = d + half.cos();
+    if denom <= 1e-9 {
+        return None;
+    }
+    // image-plane radius of the view's left and right edges
+    let edge = k * half.sin() / denom;
+    let r = x.hypot(y);
+    let rho = r * edge;
+    if rho < 1e-12 {
+        return Some([0.0, 0.0, 1.0]);
+    }
+    // ρ (d + cos θ) = k sin θ  ⇒  θ = atan2(ρ, k) + asin(ρ d / √(k² + ρ²))
+    let s = rho * d / k.hypot(rho);
+    if s > 1.0 {
+        return None;
+    }
+    let theta = rho.atan2(k) + s.asin();
+    let st = theta.sin();
+    Some([st * x / r, st * y / r, theta.cos()])
+}
+
+/// The camera rotation of a view: roll about the view axis, then tilt (positive looks up), then
+/// pan (positive looks right), degrees.
+pub fn view_rotation(pan: f64, tilt: f64, roll: f64) -> [[f64; 3]; 3] {
+    rotation(-tilt, pan, roll)
+}
+
+/// Apply a [`view_rotation`] to a view direction (world direction = R · view direction).
+pub fn rotate(r: &[[f64; 3]; 3], d: [f64; 3]) -> [f64; 3] {
+    mvec(r, d)
+}
+
+/// Equirectangular coordinates (u 0…1 = longitude −180°…180°, v 0…1 = latitude 90°…−90°) of a
+/// direction.
+pub fn equirect_uv(d: [f64; 3]) -> (f64, f64) {
+    let (lon, lat) = lonlat(d);
+    (lon / TAU + 0.5, 0.5 - lat / PI)
+}
+
+/// VR Reframe: a flat view of the sphere (a normal shot, a wide view, a little planet or a rabbit
+/// hole) that fills the sequence frame (the whole layer without a sequence, and for each eye of
+/// a stereoscopic layout). The layer is centred in the sequence 1:1 by Motion's defaults, so the
+/// view covers the sequence frame's rectangle in layer pixels and is transparent outside it.
+fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
+    // Custom, Little Planet (looking straight down), Rabbit Hole (straight up)
+    let (base_tilt, fov) = match chv(e, "view") {
+        1 => (-90.0, fv(e, "planet_fov", cx)),
+        2 => (90.0, fv(e, "planet_fov", cx)),
+        _ => (0.0, fv(e, "fov", cx)),
+    };
+    // (keyframe and pasted values are untrusted: a NaN angle would blank the frame)
+    let deg = |id| Some(fv(e, id, cx) as f64).filter(|v| v.is_finite()).unwrap_or(0.0);
+    let r = view_rotation(deg("pan"), base_tilt + deg("tilt"), deg("roll"));
+    let target = match (layout, cx.env) {
+        (0, Some(env)) => {
+            let (sw, sh) = env.sequence_size();
+            let k = img.w as f64 / env.source_size().0.max(1) as f64;
+            Some((sw as f64 * k, sh as f64 * k))
+        }
+        _ => None,
+    };
+    let fov = fov as f64;
+    per_view(img, layout, |v| {
+        let src = v.clone();
+        let (w, h) = (v.w, v.h);
+        let (tw, th) = target.filter(|(tw, th)| *tw >= 1.0 && *th >= 1.0).unwrap_or((w as f64, h as f64));
+        let (x0, y0) = ((w as f64 - tw) * 0.5, (h as f64 - th) * 0.5);
+        v.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let nx = ((x as f64 + 0.5 - x0) / tw) * 2.0 - 1.0;
+                let ny = (1.0 - (y as f64 + 0.5 - y0) / th * 2.0) * th / tw;
+                let inside = nx.abs() <= 1.0 && ny.abs() <= th / tw;
+                let o = match view_dir(nx, ny, fov) {
+                    Some(d) if inside => sample_dir(&src, mvec(&r, d)),
+                    _ => [0.0; 4],
+                };
+                *px = o;
+            }
+        });
+    });
+}
+
 /// Run `f` on each view of the frame layout.
 fn per_view(img: &mut Image, layout: u32, f: impl Fn(&mut Image)) {
     let (w, h) = (img.w, img.h);
@@ -409,6 +512,7 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
                 });
             });
         }
+        "vr_reframe" => reframe(img, e, cx, layout),
         "vr_projection" | "vr_rotate_sphere" => {
             let r = rotation(fv(e, "tilt", cx) as f64, fv(e, "pan", cx) as f64, fv(e, "roll", cx) as f64);
             let fov = if e.effect == "vr_projection" { fv(e, "fov", cx) as f64 } else { 360.0 };

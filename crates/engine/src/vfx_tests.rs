@@ -67,7 +67,8 @@ fn effects_list_reports_folders_and_badges() {
     assert_eq!(find("lens_flare")["folder"], "Lights & Glows");
     let n =
         arr.iter().filter(|e| e["kind"] == "Video" && e["category"][0] == "Video Effects" && e["folder"] != "Obsolete" && e["folder"] != Value::Null).count();
-    assert_eq!(n, 93, "Premiere 26's current Video Effects");
+    assert_eq!(n, 93 + filmcraft_project::effect::BEYOND_PREMIERE.len(), "Premiere 26's current Video Effects, and FilmCraft's own");
+    assert_eq!(find("vr_reframe")["folder"], "Immersive Video");
 }
 
 #[test]

@@ -101,6 +101,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     // the monitors' wrench menus only, as in the reference app
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.vrVideo", "VR Video", [], None),
+    uic!("view.vrVideo.littlePlanet", "Little Planet (Outside In)", [], None),
+    uic!("view.vrVideo.rabbitHole", "Rabbit Hole (Inside Out)", [], None),
     uic!("view.safeMargins", "Safe Margins", ["View", "Guide Templates"], None),
     uic!("view.guideTemplates.save", "Save Guides as Template…", ["View", "Guide Templates"], None),
     uic!("view.guideTemplates.manage", "Manage Guides…", ["View", "Guide Templates"], None),

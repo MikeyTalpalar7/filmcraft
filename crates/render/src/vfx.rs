@@ -35,6 +35,7 @@ use crate::effects::FxCtx;
 use crate::image::Image;
 use crate::{RenderOptions, SourceProvider};
 
+pub use immersive::{MAX_VIEW_FOV, equirect_uv, rotate as rotate_view, view_dir, view_rotation};
 pub use temporal::{StabilizerPath, clear_stabilizer_cache, stabilizer_path};
 
 /// What an effect may know about the clip beyond its own pixels.

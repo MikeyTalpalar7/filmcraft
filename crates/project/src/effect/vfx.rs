@@ -24,6 +24,13 @@ pub(super) const LEGACY: &[&str] = &["Legacy", "Video Effects"];
 pub const TRACK_CHOICES: &[&str] = &["None", "Video 1", "Video 2", "Video 3", "Video 4", "Video 5", "Video 6", "Video 7", "Video 8"];
 /// Equirectangular frame layouts for the Immersive Video effects.
 pub const FRAME_LAYOUTS: &[&str] = &["Monoscopic", "Stereoscopic - Over/Under", "Stereoscopic - Side by Side"];
+/// FilmCraft's own video effects, beyond Premiere 26's catalogue (ids). They sit in the Premiere
+/// folders they belong with; the catalogue checks leave them out.
+pub const BEYOND_PREMIERE: &[&str] = &["vr_reframe"];
+
+/// VR Reframe's View: a free view (Field of View, Pan, Tilt, Roll), or one looking straight down
+/// (little planet) or up (rabbit hole) whose size is the Planet Field of View.
+pub const VR_VIEWS: &[&str] = &["Custom", "Little Planet (Outside In)", "Rabbit Hole (Inside Out)"];
 /// Easing for the animated Transform presets (Grow, Shrink, Move, Spin).
 pub const EASINGS: &[&str] = &["Linear", "Ease In", "Ease Out", "Ease In and Out"];
 pub const ECHO_OPERATORS: &[&str] = &["Add", "Maximum", "Minimum", "Screen", "Composite In Back", "Composite In Front", "Blend"];
@@ -204,6 +211,18 @@ fn immersive() -> Vec<EffectDef> {
                 ang("pan", "Pan (Y Axis)", 0.0),
                 ang("roll", "Roll (Z Axis)", 0.0),
                 b("stretch", "Stretch to Fit Frame", true),
+            ],
+        ),
+        vr(
+            "vr_reframe",
+            "VR Reframe",
+            vec![
+                ch("view", "View", VR_VIEWS, 0),
+                fs("fov", "Field of View", 100.0, (10.0, 359.0), (10.0, 359.0), "°", 1),
+                fs("planet_fov", "Planet Field of View", 270.0, (90.0, 359.0), (90.0, 359.0), "°", 1),
+                ang("pan", "Pan", 0.0),
+                ang("tilt", "Tilt", 0.0),
+                ang("roll", "Roll", 0.0),
             ],
         ),
         vr("vr_rotate_sphere", "VR Rotate Sphere", vec![ang("tilt", "Tilt (X Axis)", 0.0), ang("pan", "Pan (Y Axis)", 0.0), ang("roll", "Roll (Z Axis)", 0.0)]),
@@ -1271,7 +1290,9 @@ mod tests {
         assert_eq!(n, 93);
         assert_eq!(CATALOGUE.len(), 16);
         // nothing else sits in the current folders
-        for d in effect_defs().iter().filter(|d| d.kind == EffectKind::Video && d.category.first() == Some(&"Video Effects")) {
+        for d in
+            effect_defs().iter().filter(|d| d.kind == EffectKind::Video && d.category.first() == Some(&"Video Effects") && !BEYOND_PREMIERE.contains(&d.id))
+        {
             let f = d.category[1];
             if f == "Obsolete" {
                 continue;

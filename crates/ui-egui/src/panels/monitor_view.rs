@@ -157,6 +157,11 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
             v.vr.enabled = toggled(v.vr.enabled, params);
             Ok(json!({"monitor": pfx, "vr": v.vr}))
         }
+        "vrVideo.littlePlanet" | "vrVideo.rabbitHole" => {
+            let v = view_mut(app, w);
+            v.vr = super::vr_view::planet(&v.vr, rest == "vrVideo.rabbitHole");
+            Ok(json!({"monitor": pfx, "vr": v.vr}))
+        }
         "showRulers" => {
             let v = view_mut(app, w);
             v.show_rulers = toggled(v.show_rulers, params);
@@ -829,6 +834,10 @@ pub fn wrench_items(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which) {
     }
     pick(ui, &mut out, "transparencyGrid", tl!("Transparency Grid"), v.transparency_grid);
     pick(ui, &mut out, "vrVideo", tl!("VR Video"), v.vr.enabled);
+    if v.vr.enabled {
+        pick(ui, &mut out, "vrVideo.littlePlanet", tl!("Little Planet (Outside In)"), false);
+        pick(ui, &mut out, "vrVideo.rabbitHole", tl!("Rabbit Hole (Inside Out)"), false);
+    }
     ui.separator();
     let pfx = prefix(w);
     for (key, r, label, clicked) in out {
@@ -836,9 +845,9 @@ pub fn wrench_items(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which) {
         if clicked && let Some(Err(e)) = route(app, &format!("view.{key}"), &json!({"monitor": pfx})) {
             app.ui.status = e;
         }
-        // the menu stays open for the toggles; a display mode, a resolution and Clear Guides are
+        // the menu stays open for the toggles; a display mode, a resolution, a VR view and Clear Guides are
         // choices that close it
-        if clicked && (key.starts_with("display.") || key.contains("Res.") || key == "clearGuides") {
+        if clicked && (key.starts_with("display.") || key.contains("Res.") || key.starts_with("vrVideo.") || key == "clearGuides") {
             ui.close();
         }
     }

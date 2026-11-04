@@ -88,6 +88,7 @@ const NEW_IDS: &[&str] = &[
     "vr_glow",
     "vr_plane_to_sphere",
     "vr_projection",
+    "vr_reframe",
     "vr_rotate_sphere",
     "vr_sharpen",
     "alpha_adjust",
@@ -1473,4 +1474,73 @@ fn lengths_past_the_picture_keep_their_fade_and_weighting() {
     assert!(shadow_320 < shadow_far, "the fade still follows the requested length: {shadow_320} vs {shadow_far}");
     let (glint_32, glint_320) = (total(&render("glint", 32.0)), total(&render("glint", 320.0)));
     assert!((glint_32 - glint_320).abs() > 0.01 * glint_32.abs(), "glint weighting follows the requested length: {glint_32} vs {glint_320}");
+}
+
+#[test]
+fn view_dir_is_rectilinear_then_stereographic_and_continuous() {
+    use crate::vfx::view_dir;
+    let angle = |x: f64, fov: f64| view_dir(x, 0.0, fov).map(|d| d[2].clamp(-1.0, 1.0).acos().to_degrees());
+    assert_eq!(view_dir(0.0, 0.0, 120.0), Some([0.0, 0.0, 1.0]));
+    // the view's edge is half the field of view away from its centre, at every zoom
+    for fov in [30.0, 90.0, 120.0, 180.0, 270.0, 359.0] {
+        let a = angle(1.0, fov).unwrap();
+        assert!((a - fov / 2.0).abs() < 1e-6, "{fov}: {a}");
+    }
+    // a pinhole view at 90°: half-way to the edge is atan(0.5)
+    assert!((angle(0.5, 90.0).unwrap() - 0.5f64.atan().to_degrees()).abs() < 1e-9);
+    // stereographic past 180°: half-way is 2·atan(tan(θ/2)/2)
+    let half = 2.0 * ((135.0f64 / 2.0).to_radians().tan() / 2.0).atan();
+    assert!((angle(0.5, 270.0).unwrap() - half.to_degrees()).abs() < 1e-9);
+    // zooming out never jumps
+    let mut last = angle(0.7, 60.0).unwrap();
+    for f in 61..=359 {
+        let a = angle(0.7, f as f64).unwrap();
+        assert!(a >= last - 1e-9 && a - last < 2.0, "{f}: {last} → {a}");
+        last = a;
+    }
+    // hostile input
+    for (x, fov) in [(f64::NAN, 90.0), (1.0, f64::NAN), (1e300, 359.0), (1.0, -5.0), (1.0, 1e9)] {
+        if let Some(d) = view_dir(x, 0.0, fov) {
+            assert!(d.iter().all(|v| v.is_finite()), "{x} {fov}");
+        }
+    }
+}
+
+#[test]
+fn vr_reframe_makes_little_planets_and_rabbit_holes() {
+    // sky (blue) above the horizon, ground (green) below
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let is = |p: [f32; 4], c: usize| p[c] > 0.9 && p[3] > 0.99;
+    let (blue, green) = (2, 1);
+    let mut e = inst("vr_reframe");
+    // Little Planet: the ground in the middle, the sky all round it
+    set(&mut e, "view", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), green));
+    assert!(is(o.get(1, 1), blue) && is(o.get(126, 62), blue));
+    // Rabbit Hole: the other way round
+    set(&mut e, "view", ParamValue::Choice(2));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), blue));
+    assert!(is(o.get(1, 1), green) && is(o.get(126, 62), green));
+    // Custom, level: sky above the middle, ground below; tilting up shows only sky
+    set(&mut e, "view", ParamValue::Choice(0));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 20), blue) && is(o.get(64, 44), green));
+    setf(&mut e, "tilt", 80.0);
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), blue) && is(o.get(64, 60), blue));
+    // hostile values stay finite
+    for f in [f64::NAN, -1e9, 1e9] {
+        setf(&mut e, "fov", f);
+        setf(&mut e, "pan", f);
+        let o = run("vr_reframe", &e, &img, &cx());
+        assert!(o.px.iter().all(|v| v.is_finite()));
+    }
 }

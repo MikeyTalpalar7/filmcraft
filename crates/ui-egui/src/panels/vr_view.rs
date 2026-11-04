@@ -1,16 +1,16 @@
-//! VR Video view of the monitors: an equirectangular (360°) picture shown as a perspective view
-//! that the user looks around in.
+//! VR Video view of the monitors: an equirectangular (360°) picture shown as a view that the
+//! user looks around in. It is the projection of the VR Reframe effect ([`filmcraft_render::vfx::view_dir`]):
+//! a normal perspective view up to 90°, easing into a stereographic one as it zooms out (up to
+//! 359°), so looking straight down at a wide view gives a little planet and straight up a rabbit
+//! hole (`view.vrVideo.littlePlanet` / `view.vrVideo.rabbitHole`).
 //!
 //! The frame texture is drawn as a tessellated mesh: every grid vertex of the view is turned
-//! into a direction on the sphere (field of view, then pitch, then yaw) and from there into
-//! equirectangular texture coordinates. Triangles that cross the ±180° seam are split there, so
+//! into a direction on the sphere and from there into equirectangular texture coordinates. Triangles that cross the ±180° seam are split there, so
 //! the texture needs no wrapping. Stereoscopic media shows its left eye ([`Spherical::eye_region`]).
 //!
 //! Drag in the picture to look around, scroll to change the field of view, double-click to go
 //! back to the initial view. State is [`VrView`] (serde: `ui.set {"program": {"vr": {…}}}`),
 //! toggled with `view.vrVideo` (wrench menu: `<monitor>.settings.vrVideo`).
-
-use std::f32::consts::{PI, TAU};
 
 use egui::epaint::{Mesh, Vertex};
 use egui::{Color32, Painter, Pos2, Rect, Response, Shape, TextureId, pos2};
@@ -21,28 +21,25 @@ use crate::theme::Tokens;
 
 pub const DEFAULT_FOV: f32 = 90.0;
 pub const MIN_FOV: f32 = 30.0;
-pub const MAX_FOV: f32 = 150.0;
-/// Mesh resolution (cells across and down).
-const COLS: usize = 48;
-const ROWS: usize = 32;
+pub const MAX_FOV: f32 = filmcraft_render::vfx::MAX_VIEW_FOV as f32;
+/// The field of view of the little planet and rabbit hole presets.
+pub const PLANET_FOV: f32 = 270.0;
+/// Mesh resolution (cells across and down): fine enough for the strong curvature of wide views.
+const COLS: usize = 96;
+const ROWS: usize = 64;
 
 /// Equirectangular texture coordinates (u 0…1 = longitude −180°…180°, v 0…1 = latitude 90°…−90°)
 /// seen at the view point (`nx`, `ny`), each −1…1 across the view (y up), for a view `aspect`
-/// (width / height).
-pub fn view_uv(view: &VrView, aspect: f32, nx: f32, ny: f32) -> (f32, f32) {
+/// (width / height). `None` past the edge of the sphere (the corners of the widest views).
+pub fn view_uv(view: &VrView, aspect: f32, nx: f32, ny: f32) -> Option<(f32, f32)> {
+    use filmcraft_render::vfx::{equirect_uv, rotate_view, view_dir, view_rotation};
     let finite = |v: f32, or: f32| if v.is_finite() { v } else { or };
-    let half = (finite(view.fov, DEFAULT_FOV).clamp(MIN_FOV, MAX_FOV).to_radians() * 0.5).tan();
     let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
-    let (x, y, z) = (nx * half, ny * half / aspect, 1.0f32);
-    // pitch about X (positive looks up), then yaw about Y (positive looks right)
-    let (sp, cp) = finite(view.pitch, 0.0).clamp(-90.0, 90.0).to_radians().sin_cos();
-    let (y, z) = (y * cp + z * sp, z * cp - y * sp);
-    let (sy, cy) = wrap_yaw(view.yaw).to_radians().sin_cos();
-    let (x, z) = (x * cy + z * sy, z * cy - x * sy);
-    let len = (x * x + y * y + z * z).sqrt().max(f32::MIN_POSITIVE);
-    let lon = x.atan2(z);
-    let lat = (y / len).clamp(-1.0, 1.0).asin();
-    (lon / TAU + 0.5, 0.5 - lat / PI)
+    let fov = finite(view.fov, DEFAULT_FOV).clamp(MIN_FOV, MAX_FOV);
+    let d = view_dir(f64::from(nx), f64::from(ny / aspect), f64::from(fov))?;
+    let r = view_rotation(f64::from(wrap_yaw(view.yaw)), f64::from(finite(view.pitch, 0.0).clamp(-90.0, 90.0)), 0.0);
+    let (u, v) = equirect_uv(rotate_view(&r, d));
+    Some((u as f32, v as f32))
 }
 
 /// One vertex of a view triangle: screen position and unwrapped equirectangular uv.
@@ -106,15 +103,16 @@ pub fn mesh(tex: TextureId, rect: Rect, view: &VrView, eye: [f32; 4]) -> Mesh {
         return m;
     }
     let aspect = rect.width() / rect.height();
-    let grid: Vec<V> = (0..=ROWS)
+    let grid: Vec<Option<V>> = (0..=ROWS)
         .flat_map(|r| (0..=COLS).map(move |c| (c, r)))
         .map(|(c, r)| {
             let (fx, fy) = (c as f32 / COLS as f32, r as f32 / ROWS as f32);
-            let (u, v) = view_uv(view, aspect, fx * 2.0 - 1.0, 1.0 - fy * 2.0);
-            V { pos: pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height()), u, v }
+            let (u, v) = view_uv(view, aspect, fx * 2.0 - 1.0, 1.0 - fy * 2.0)?;
+            Some(V { pos: pos2(rect.min.x + fx * rect.width(), rect.min.y + fy * rect.height()), u, v })
         })
         .collect();
-    let at = |c: usize, r: usize| grid.get(r * (COLS + 1) + c).copied();
+    // (cells with a corner past the sphere are left out)
+    let at = |c: usize, r: usize| grid.get(r * (COLS + 1) + c).copied().flatten();
     let [ex, ey, ew, eh] = eye;
     for r in 0..ROWS {
         for c in 0..COLS {
@@ -135,6 +133,12 @@ pub fn mesh(tex: TextureId, rect: Rect, view: &VrView, eye: [f32; 4]) -> Mesh {
         }
     }
     m
+}
+
+/// A wide view looking straight down (`up` false: a little planet, the scene seen from outside)
+/// or straight up (a rabbit hole, seen from inside), keeping the heading.
+pub fn planet(view: &VrView, up: bool) -> VrView {
+    VrView { enabled: true, yaw: view.yaw, pitch: if up { 90.0 } else { -90.0 }, fov: PLANET_FOV }
 }
 
 /// The view's starting point: the media's initial pose, else straight ahead.
@@ -199,13 +203,26 @@ mod tests {
 
     #[test]
     fn centre_of_the_view_is_where_it_looks() {
-        let close = |(u, v): (f32, f32), (eu, ev): (f32, f32)| (u - eu).abs() < 1e-4 && (v - ev).abs() < 1e-4;
+        let close = |uv: Option<(f32, f32)>, (eu, ev): (f32, f32)| uv.is_some_and(|(u, v)| (u - eu).abs() < 1e-4 && (v - ev).abs() < 1e-4);
         assert!(close(view_uv(&look(0.0, 0.0), 1.0, 0.0, 0.0), (0.5, 0.5)));
         assert!(close(view_uv(&look(90.0, 0.0), 1.0, 0.0, 0.0), (0.75, 0.5)));
         assert!(close(view_uv(&look(-90.0, 0.0), 1.0, 0.0, 0.0), (0.25, 0.5)));
         assert!(close(view_uv(&look(0.0, 45.0), 1.0, 0.0, 0.0), (0.5, 0.25)));
         // the right edge of a 90° view is 45° to the right
         assert!(close(view_uv(&look(0.0, 0.0), 1.0, 1.0, 0.0), (0.625, 0.5)));
+    }
+
+    #[test]
+    fn planets_look_at_the_poles_and_wide_views_fill_the_picture() {
+        let base = look(30.0, 0.0);
+        // little planet: the nadir in the middle; rabbit hole: the zenith
+        assert!(view_uv(&planet(&base, false), 1.0, 0.0, 0.0).is_some_and(|(_, v)| v > 0.999));
+        assert!(view_uv(&planet(&base, true), 1.0, 0.0, 0.0).is_some_and(|(_, v)| v < 0.001));
+        // zoomed all the way out the corners still reach the sphere at 16:9 (no black corners)
+        let wide = VrView { fov: MAX_FOV, ..base };
+        assert!(view_uv(&wide, 16.0 / 9.0, 1.0, 9.0 / 16.0).is_some());
+        let m = mesh(TextureId::default(), Rect::from_min_max(pos2(0.0, 0.0), pos2(320.0, 180.0)), &planet(&base, false), [0.0, 0.0, 1.0, 1.0]);
+        assert!(m.indices.len() >= COLS * ROWS * 6);
     }
 
     #[test]
