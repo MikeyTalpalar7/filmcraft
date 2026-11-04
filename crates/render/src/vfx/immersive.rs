@@ -89,6 +89,34 @@ fn sample_dir(img: &Image, d: V3) -> [f32; 4] {
 /// Widest view [`view_dir`] draws, degrees (a whole turn would put the antipode on every edge).
 pub const MAX_VIEW_FOV: f64 = 359.0;
 
+/// How a flat view maps the sphere ([`lens_dir`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Lens {
+    /// Straight up to 90°, easing into [`Lens::Curve`]`(1.0)` by 180° ([`view_dir`]).
+    Auto,
+    /// The general perspective projection from a point `d` (0…1) behind the centre of the sphere:
+    /// 0 is straight (rectilinear: straight lines stay straight, up to 179°), 1 curved
+    /// (stereographic: round shapes stay round, the whole sphere but its antipode).
+    Curve(f64),
+    /// Equidistant fisheye: the distance from the centre is the angle from the view axis.
+    Fisheye,
+    /// Equisolid (a mirror ball's reflection): at 360° the whole sphere fills a disc.
+    MirrorBall,
+    /// Cylindrical panorama strip: longitude across, verticals stay vertical.
+    Panorama,
+}
+
+/// Shaping applied with a [`Lens`]: `twist` (degrees at the view's edge, turning with the
+/// distance from the centre), `stretch` (−100…100: wider or taller, keeping the area) and
+/// `center` (−100…100: the middle of the view, a little planet's ground, made bigger or smaller
+/// against its surroundings).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub twist: f64,
+    pub stretch: f64,
+    pub center: f64,
+}
+
 /// The direction seen at a point of a flat view of the sphere, looking down +Z with +Y up: `x`
 /// runs −1…1 across the view's width, `y` (up) is scaled the same (−h/w…h/w), `fov` is the
 /// horizontal field of view in degrees (1…[`MAX_VIEW_FOV`]).
@@ -96,36 +124,88 @@ pub const MAX_VIEW_FOV: f64 = 359.0;
 /// Up to 90° this is a rectilinear (pinhole) view. From there to 180° it eases into the
 /// stereographic projection, which reaches the whole sphere but its antipode, so the view keeps
 /// zooming out without running off the picture: pointed at the nadir that is a "little planet"
-/// (outside in), at the zenith a "rabbit hole" (inside out). Both ends and the blend are the
-/// general perspective projection from a point `d` behind the centre of the sphere (`d` = 0:
-/// rectilinear, 1: stereographic): ρ = (d + 1) sin θ / (d + cos θ). `None` past the sphere.
+/// (outside in), at the zenith a "rabbit hole" (inside out). `None` past the sphere.
 pub fn view_dir(x: f64, y: f64, fov: f64) -> Option<[f64; 3]> {
+    lens_dir(x, y, fov, Lens::Auto, Shape::default())
+}
+
+/// [`view_dir`] through any [`Lens`], with [`Shape`]. `None` past what the lens reaches (the
+/// corners of a wide fisheye or mirror ball).
+pub fn lens_dir(x: f64, y: f64, fov: f64, lens: Lens, shape: Shape) -> Option<[f64; 3]> {
     if !(x.is_finite() && y.is_finite()) {
         return None;
     }
-    let fov = if fov.is_finite() { fov.clamp(1.0, MAX_VIEW_FOV) } else { 90.0 };
+    let fin = |v: f64, lo: f64, hi: f64| if v.is_finite() { v.clamp(lo, hi) } else { 0.0 };
+    let fov = if fov.is_finite() { fov.clamp(1.0, 360.0) } else { 90.0 };
+    // Stretch (area-preserving), then Twist (a swirl growing towards the edge)
+    let k = 2f64.powf(fin(shape.stretch, -100.0, 100.0) / 100.0).sqrt();
+    let (x, y) = (x / k, y * k);
+    let r = x.hypot(y);
+    let (sa, ca) = (fin(shape.twist, -3600.0, 3600.0).to_radians() * r).sin_cos();
+    let (x, y) = (x * ca - y * sa, x * sa + y * ca);
+    let d = match lens {
+        Lens::Panorama => {
+            let half = (fov.min(MAX_VIEW_FOV) * 0.5).to_radians();
+            return Some(center_size(dir(x * half, (y * half).atan()), shape.center));
+        }
+        Lens::Fisheye => radial(x, y, (fov * 0.5).to_radians().min(PI), Some),
+        Lens::MirrorBall => {
+            let edge = 2.0 * (fov * 0.25).to_radians().sin();
+            radial(x, y, edge, |rho| ((rho * 0.5) <= 1.0).then(|| 2.0 * (rho * 0.5).asin()))
+        }
+        Lens::Auto => general(x, y, fov.min(MAX_VIEW_FOV), f64::from(smoothstep(90.0, 180.0, fov as f32))),
+        Lens::Curve(d) => {
+            let d = fin(d, 0.0, 1.0);
+            // the widest view this curve reaches (2·acos(−d)), less a degree
+            let widest = (2.0 * (-d).acos().to_degrees() - 1.0).min(MAX_VIEW_FOV);
+            general(x, y, fov.min(widest), d)
+        }
+    }?;
+    Some(center_size(d, shape.center))
+}
+
+/// A radially symmetric lens: `theta` turns the image-plane radius (the view's edge at `edge`)
+/// into the angle from the view axis.
+fn radial(x: f64, y: f64, edge: f64, theta: impl Fn(f64) -> Option<f64>) -> Option<V3> {
+    let r = x.hypot(y);
+    if r < 1e-12 {
+        return Some([0.0, 0.0, 1.0]);
+    }
+    let t = theta(r * edge).filter(|t| t.is_finite() && *t <= PI + 1e-9)?;
+    let st = t.sin();
+    Some([st * x / r, st * y / r, t.cos()])
+}
+
+/// The general perspective projection from `d` behind the centre: ρ = (d + 1) sin θ / (d + cos θ).
+fn general(x: f64, y: f64, fov: f64, d: f64) -> Option<V3> {
     let half = (fov * 0.5).to_radians();
-    let d = f64::from(smoothstep(90.0, 180.0, fov as f32));
     let k = d + 1.0;
     let denom = d + half.cos();
     if denom <= 1e-9 {
         return None;
     }
-    // image-plane radius of the view's left and right edges
-    let edge = k * half.sin() / denom;
-    let r = x.hypot(y);
-    let rho = r * edge;
-    if rho < 1e-12 {
-        return Some([0.0, 0.0, 1.0]);
-    }
     // ρ (d + cos θ) = k sin θ  ⇒  θ = atan2(ρ, k) + asin(ρ d / √(k² + ρ²))
-    let s = rho * d / k.hypot(rho);
-    if s > 1.0 {
-        return None;
+    radial(x, y, k * half.sin() / denom, |rho| {
+        let s = rho * d / k.hypot(rho);
+        (s <= 1.0).then(|| rho.atan2(k) + s.asin())
+    })
+}
+
+/// Planet Size: the angle from the view axis bent by a power curve (θ' = π (θ/π)^γ), so the
+/// middle of the view takes more (positive) or less of it.
+fn center_size(d: V3, amount: f64) -> V3 {
+    if !amount.is_finite() || amount.abs() < 1e-9 {
+        return d;
     }
-    let theta = rho.atan2(k) + s.asin();
-    let st = theta.sin();
-    Some([st * x / r, st * y / r, theta.cos()])
+    let gamma = 2f64.powf(amount.clamp(-100.0, 100.0) / 50.0);
+    let t = d[2].clamp(-1.0, 1.0).acos();
+    let r = d[0].hypot(d[1]);
+    if r < 1e-12 {
+        return d;
+    }
+    let t2 = PI * (t / PI).powf(gamma);
+    let st = t2.sin();
+    [st * d[0] / r, st * d[1] / r, t2.cos()]
 }
 
 /// The camera rotation of a view: roll about the view axis, then tilt (positive looks up), then
@@ -169,6 +249,16 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
         _ => None,
     };
     let fov = fov as f64;
+    let lens = match chv(e, "lens") {
+        1 => Lens::Curve(0.0),
+        2 => Lens::Curve(1.0),
+        3 => Lens::Fisheye,
+        4 => Lens::MirrorBall,
+        5 => Lens::Panorama,
+        6 => Lens::Curve(f64::from(fv(e, "curve", cx)) / 100.0),
+        _ => Lens::Auto,
+    };
+    let shape = Shape { twist: deg("twist"), stretch: deg("stretch"), center: deg("planet_size") };
     per_view(img, layout, |v| {
         let src = v.clone();
         let (w, h) = (v.w, v.h);
@@ -179,7 +269,7 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
                 let nx = ((x as f64 + 0.5 - x0) / tw) * 2.0 - 1.0;
                 let ny = (1.0 - (y as f64 + 0.5 - y0) / th * 2.0) * th / tw;
                 let inside = nx.abs() <= 1.0 && ny.abs() <= th / tw;
-                let o = match view_dir(nx, ny, fov) {
+                let o = match lens_dir(nx, ny, fov, lens, shape) {
                     Some(d) if inside => sample_dir(&src, mvec(&r, d)),
                     _ => [0.0; 4],
                 };

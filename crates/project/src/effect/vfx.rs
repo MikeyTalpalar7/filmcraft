@@ -31,6 +31,10 @@ pub const BEYOND_PREMIERE: &[&str] = &["vr_reframe"];
 /// VR Reframe's View: a free view (Field of View, Pan, Tilt, Roll), or one looking straight down
 /// (little planet) or up (rabbit hole) whose size is the Planet Field of View.
 pub const VR_VIEWS: &[&str] = &["Custom", "Little Planet (Outside In)", "Rabbit Hole (Inside Out)"];
+/// VR Reframe's Lens: Automatic (straight, curving as the view widens), Straight (rectilinear),
+/// Curved (stereographic), Fisheye (equidistant), Mirror Ball (equisolid), Panorama Strip
+/// (cylindrical) and Custom Curve (straight 0% … curved 100%, the Curve parameter).
+pub const VR_LENSES: &[&str] = &["Automatic", "Straight", "Curved", "Fisheye", "Mirror Ball", "Panorama Strip", "Custom Curve"];
 /// Easing for the animated Transform presets (Grow, Shrink, Move, Spin).
 pub const EASINGS: &[&str] = &["Linear", "Ease In", "Ease Out", "Ease In and Out"];
 pub const ECHO_OPERATORS: &[&str] = &["Add", "Maximum", "Minimum", "Screen", "Composite In Back", "Composite In Front", "Blend"];
@@ -218,11 +222,16 @@ fn immersive() -> Vec<EffectDef> {
             "VR Reframe",
             vec![
                 ch("view", "View", VR_VIEWS, 0),
-                fs("fov", "Field of View", 100.0, (10.0, 359.0), (10.0, 359.0), "°", 1),
-                fs("planet_fov", "Planet Field of View", 270.0, (90.0, 359.0), (90.0, 359.0), "°", 1),
+                ch("lens", "Lens", VR_LENSES, 0),
+                pct("curve", "Curve", 50.0),
+                fs("fov", "Field of View", 100.0, (10.0, 360.0), (10.0, 360.0), "°", 1),
+                fs("planet_fov", "Planet Field of View", 270.0, (90.0, 360.0), (90.0, 360.0), "°", 1),
                 ang("pan", "Pan", 0.0),
                 ang("tilt", "Tilt", 0.0),
                 ang("roll", "Roll", 0.0),
+                ang("twist", "Twist", 0.0),
+                fs("stretch", "Stretch", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
+                fs("planet_size", "Planet Size", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
             ],
         ),
         vr("vr_rotate_sphere", "VR Rotate Sphere", vec![ang("tilt", "Tilt (X Axis)", 0.0), ang("pan", "Pan (Y Axis)", 0.0), ang("roll", "Roll (Z Axis)", 0.0)]),

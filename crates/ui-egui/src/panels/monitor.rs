@@ -445,7 +445,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     // the flat picture's overlays and drags (VR Video looks around instead)
     let flat = show_picture && !(mv.vr.enabled && !compare);
     // (Comparison View always fits both frames)
-    if show_picture && !compare && !vr_input(app, ui, which, &pic_resp, pic, spherical.as_ref()) {
+    // (over a VR Reframe clip the wheel zooms the effect instead of the monitor)
+    let reframing = which == Which::Program && crate::panels::vr_reframe_handles::takes_wheel(app, ui, pic);
+    if show_picture && !compare && !reframing && !vr_input(app, ui, which, &pic_resp, pic, spherical.as_ref()) {
         monitor_view::zoom_pan_input(app, ui, which, video_area, pic, display_w, ppp);
     }
     if which == Which::Program && flat {
@@ -458,6 +460,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             crate::panels::masks::monitor_overlay(app, ui, pic, frame_size);
             crate::panels::motion_path::monitor_overlay(app, ui, pic, frame_size);
             crate::panels::transform_handles::monitor_overlay(app, ui, pic, frame_size);
+            // (last, on top: it only drags, and stands aside while another effect is selected)
+            crate::panels::vr_reframe_handles::monitor_overlay(app, ui, pic);
         }
     }
     if show_picture {

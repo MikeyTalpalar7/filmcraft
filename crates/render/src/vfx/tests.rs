@@ -1544,3 +1544,48 @@ fn vr_reframe_makes_little_planets_and_rabbit_holes() {
         assert!(o.px.iter().all(|v| v.is_finite()));
     }
 }
+
+#[test]
+fn lenses_and_shaping_map_as_specified() {
+    use crate::vfx::{Lens, Shape, lens_dir};
+    let none = Shape::default();
+    let angle = |x: f64, y: f64, fov: f64, lens: Lens, sh: Shape| lens_dir(x, y, fov, lens, sh).map(|d| d[2].clamp(-1.0, 1.0).acos().to_degrees());
+    let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-6);
+    // every lens puts the view's left and right edges half the field of view out
+    for lens in [Lens::Curve(0.0), Lens::Curve(0.5), Lens::Curve(1.0), Lens::Fisheye, Lens::MirrorBall] {
+        assert!(close(angle(1.0, 0.0, 120.0, lens, none), 60.0), "{lens:?}");
+    }
+    // fisheye: the angle grows evenly with the distance from the centre
+    assert!(close(angle(0.5, 0.0, 200.0, Lens::Fisheye, none), 50.0));
+    // mirror ball at 360°: the edge is the antipode, half-way is 2·asin(½) = 60°
+    assert!(close(angle(1.0, 0.0, 360.0, Lens::MirrorBall, none), 180.0));
+    assert!(close(angle(0.5, 0.0, 360.0, Lens::MirrorBall, none), 60.0));
+    // ... and nothing past its disc
+    assert!(lens_dir(1.0, 0.6, 360.0, Lens::MirrorBall, none).is_none());
+    // a straight lens can't reach 180°: it stops a degree short
+    assert!(close(angle(1.0, 0.0, 359.0, Lens::Curve(0.0), none), 89.5));
+    // panorama strip: verticals stay vertical (same longitude up a column), x is longitude
+    let lon = |d: [f64; 3]| d[0].atan2(d[2]).to_degrees();
+    let (a, b) = (lens_dir(0.5, 0.0, 300.0, Lens::Panorama, none).unwrap(), lens_dir(0.5, 0.4, 300.0, Lens::Panorama, none).unwrap());
+    assert!((lon(a) - 75.0).abs() < 1e-6 && (lon(b) - 75.0).abs() < 1e-6);
+    // twist turns a point at the edge by the full amount
+    let tw = lens_dir(1.0, 0.0, 120.0, Lens::Fisheye, Shape { twist: 90.0, ..none }).unwrap();
+    let up = lens_dir(0.0, 1.0, 120.0, Lens::Fisheye, none).unwrap();
+    assert!(tw.iter().zip(up).all(|(a, b)| (a - b).abs() < 1e-9));
+    // stretch makes the view wider: the same point reaches less far out horizontally
+    assert!(angle(1.0, 0.0, 120.0, Lens::Fisheye, Shape { stretch: 100.0, ..none }).unwrap() < 60.0);
+    // planet size: a positive value gives the middle more of the view
+    let (big, small) = (Shape { center: 60.0, ..none }, Shape { center: -60.0, ..none });
+    let mid = angle(0.5, 0.0, 300.0, Lens::Curve(1.0), none).unwrap();
+    assert!(angle(0.5, 0.0, 300.0, Lens::Curve(1.0), big).unwrap() < mid);
+    assert!(angle(0.5, 0.0, 300.0, Lens::Curve(1.0), small).unwrap() > mid);
+    // hostile shaping stays finite
+    for v in [f64::NAN, f64::INFINITY, -1e300] {
+        let sh = Shape { twist: v, stretch: v, center: v };
+        for lens in [Lens::Auto, Lens::Curve(v), Lens::Fisheye, Lens::MirrorBall, Lens::Panorama] {
+            if let Some(d) = lens_dir(0.3, 0.2, v, lens, sh) {
+                assert!(d.iter().all(|c| c.is_finite()), "{lens:?} {v}");
+            }
+        }
+    }
+}
