@@ -336,6 +336,7 @@ pub(crate) fn media_info(name: &str, spec: &MediaSpec) -> MediaInfo {
             bitrate: None,
             hdr: None,
             color_assumed: None,
+            spherical: None,
         }),
         audio_streams: spec
             .audio

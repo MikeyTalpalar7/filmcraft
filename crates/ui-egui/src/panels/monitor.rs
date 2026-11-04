@@ -39,12 +39,14 @@ struct PictureCtx {
     pic: Rect,
     video_area: Rect,
     prefix: &'static str,
+    /// The shown media's 360° metadata (Source monitor).
+    spherical: Option<filmcraft_media::Spherical>,
 }
 
 /// The picture block: schedules this frame's render request (GPU or CPU), shows the texture
 /// that is ready, and draws the safe margins, comparison reference and display-mode label.
 fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &crate::state::MonitorView, pc: PictureCtx) {
-    let PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix } = pc;
+    let PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix, spherical } = pc;
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let display = mv.display_mode().unwrap_or(DisplayMode::Composite);
@@ -137,7 +139,7 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
         }
     }
     if let Some(tex) = shown {
-        ui.painter().image(tex, pic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        paint_frame(ui, tex, pic, mv, !compare, spherical.as_ref(), &t);
     }
     if let Some(ra) = ref_area {
         // the reference frame (CPU path)
@@ -210,6 +212,61 @@ fn shown_view(saved: &crate::state::MonitorView, cinema: bool) -> crate::state::
         mv.show_rulers = false;
     }
     mv
+}
+
+/// Shows the frame texture in the picture: flat, or as the VR Video view (`vr_ok`: not in
+/// Comparison View).
+fn paint_frame(
+    ui: &egui::Ui,
+    tex: egui::TextureId,
+    pic: Rect,
+    mv: &crate::state::MonitorView,
+    vr_ok: bool,
+    spherical: Option<&filmcraft_media::Spherical>,
+    t: &Tokens,
+) {
+    if mv.vr.enabled && vr_ok {
+        crate::panels::vr_view::paint(ui.painter(), tex, pic, &mv.vr, spherical, t);
+    } else {
+        ui.painter().image(tex, pic, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    }
+}
+
+/// A 360° clip opened in the Source monitor starts in VR Video, at its initial view.
+fn auto_vr(app: &mut FilmcraftApp, which: Which, spherical: Option<&filmcraft_media::Spherical>) {
+    if which != Which::Source || app.ui.source_vr_auto == app.session.state.source_item {
+        return;
+    }
+    app.ui.source_vr_auto = app.session.state.source_item;
+    if spherical.is_some() {
+        app.ui.source.vr = crate::panels::vr_view::initial(spherical, app.ui.source.vr.fov);
+    }
+}
+
+/// VR Video input on the picture: dragging looks around instead of panning, moving graphics or
+/// dragging the clip out. False when VR Video is off.
+fn vr_input(app: &mut FilmcraftApp, ui: &egui::Ui, which: Which, resp: &egui::Response, pic: Rect, spherical: Option<&filmcraft_media::Spherical>) -> bool {
+    let mut view = monitor_view::view(app, which).vr;
+    if !view.enabled {
+        return false;
+    }
+    crate::panels::vr_view::input(ui, resp, pic, &mut view, spherical);
+    monitor_view::view_mut(app, which).vr = view;
+    true
+}
+
+/// The 360° metadata of the media the monitor shows (the Source monitor's clip, or a subclip's
+/// parent media). Sequences carry none.
+fn spherical_media(app: &FilmcraftApp, which: Which) -> Option<filmcraft_media::Spherical> {
+    if which != Which::Source {
+        return None;
+    }
+    let item = app.session.state.source_item?;
+    let media = filmcraft_engine::clip_ops::source_view(&app.session, item).map(|v| v.media).unwrap_or(item);
+    match &app.session.project.item(media)?.kind {
+        ItemKind::Media(m) => m.info.video.as_ref()?.spherical,
+        _ => None,
+    }
 }
 
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which) {
@@ -287,6 +344,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     };
     let range_start = mark_in.unwrap_or(origin);
     let prefix = if which == Which::Program { "program" } else { "source" };
+    let spherical = spherical_media(app, which);
+    auto_vr(app, which, spherical.as_ref());
     let mv = shown_view(monitor_view::view(app, which), cinema);
     let display = mv.display_mode().unwrap_or(DisplayMode::Composite);
     // Multi-Camera view: the angle grid on the left, the program on the right (bypassed in cinema)
@@ -362,7 +421,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     let saved_clip = ui.clip_rect();
     ui.set_clip_rect(saved_clip.intersect(if mv.zoom.is_some() && !compare && !cinema { video_area } else { picture_area.expand(12.0) }));
     if show_picture {
-        draw_picture(app, ui, which, &mv, PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix });
+        draw_picture(
+            app,
+            ui,
+            which,
+            &mv,
+            PictureCtx { target, frame_size, rate, time, duration, drop_frame, compare, ref_area, pic, video_area, prefix, spherical },
+        );
     }
     drop_indicator(app, ui, video_area, which, &t);
     if cinema {
@@ -377,11 +442,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     // Click/drag in the picture: the Hand tool pans a magnified picture, otherwise focus.
     let pic_resp = ui.interact(pic, egui::Id::unique((prefix, "pic")), if show_picture { Sense::click_and_drag() } else { Sense::hover() });
     app.auto.add(&format!("{prefix}.picture"), pic.intersect(video_area), "picture");
+    // the flat picture's overlays and drags (VR Video looks around instead)
+    let flat = show_picture && !(mv.vr.enabled && !compare);
     // (Comparison View always fits both frames)
-    if show_picture && !compare {
+    if show_picture && !compare && !vr_input(app, ui, which, &pic_resp, pic, spherical.as_ref()) {
         monitor_view::zoom_pan_input(app, ui, which, video_area, pic, display_w, ppp);
     }
-    if which == Which::Program && show_picture {
+    if which == Which::Program && flat {
         // an armed eyedropper owns clicks on the picture: the overlays would sit on top and take
         // them (the selected clip's transform handles cover it, #1023)
         if app.ui.eyedropper.is_some() {
@@ -400,7 +467,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     if let Some((top, left)) = ruler_rects {
         monitor_view::rulers(app, ui, which, top, left, video_area, pic, frame_size);
     }
-    if which == Which::Source && show_picture && pic_resp.drag_started_by(egui::PointerButton::Primary) && app.ui.tool != crate::state::Tool::Hand {
+    if which == Which::Source && flat && pic_resp.drag_started_by(egui::PointerButton::Primary) && app.ui.tool != crate::state::Tool::Hand {
         crate::panels::source_drag::begin(app, ui, true, true);
     }
     if pic_resp.double_clicked() && which == Which::Source {

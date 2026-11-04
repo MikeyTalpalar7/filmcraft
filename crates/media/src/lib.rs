@@ -136,6 +136,55 @@ pub struct VideoStreamInfo {
     /// and media info saved before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_assumed: Option<filmcraft_color::ColorAssumed>,
+    /// 360° (spherical) video metadata, when the file marks the stream as spherical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spherical: Option<Spherical>,
+}
+
+/// How a spherical (360°) video maps the sphere onto the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Projection {
+    /// x is longitude −180°…180°, y is latitude 90°…−90°.
+    #[default]
+    Equirectangular,
+    /// Six cube faces (the 3×2 layout of the Spherical Video V2 `cbmp` box).
+    Cubemap,
+    /// A projection FilmCraft does not model (a custom mesh).
+    Other,
+}
+
+/// How the two eyes of a stereoscopic video share the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StereoLayout {
+    #[default]
+    Mono,
+    /// Left eye on top, right eye below.
+    TopBottom,
+    /// Left eye on the left, right eye on the right.
+    LeftRight,
+}
+
+/// 360° video metadata (Google Spherical Video V1 / V2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Spherical {
+    pub projection: Projection,
+    pub stereo: StereoLayout,
+    /// The initial view (pose) in degrees.
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
+impl Spherical {
+    /// The part of the frame (x, y, w, h as fractions) that holds the left (or only) eye's view.
+    pub fn eye_region(&self) -> [f32; 4] {
+        match self.stereo {
+            StereoLayout::Mono => [0.0, 0.0, 1.0, 1.0],
+            StereoLayout::TopBottom => [0.0, 0.0, 1.0, 0.5],
+            StereoLayout::LeftRight => [0.0, 0.0, 0.5, 1.0],
+        }
+    }
 }
 
 /// Most audio streams a source reports (the count comes from the file: never trusted).
