@@ -324,6 +324,7 @@ impl Mp4Source {
                 bitrate,
                 hdr: entry.video.as_ref().and_then(|v| hdr_metadata(v.mastering_display.as_ref(), v.content_light)),
                 color_assumed: Some(assumed),
+                spherical: spherical::read(&bytes, file.moov_offset, t.id),
             };
             if rotation % 2 == 1 {
                 (info.width, info.height) = (info.height, info.width);
@@ -976,6 +977,8 @@ pub fn reader_opener(name: &str, head: &[u8], reader: &filmcraft_media::SharedRe
     }
     Some(Mp4Source::open_reader(name, reader.clone()).map(|s| Arc::new(s) as SharedSource).map_err(Into::into))
 }
+
+mod spherical;
 
 #[cfg(test)]
 mod tests;

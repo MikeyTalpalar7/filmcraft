@@ -341,6 +341,26 @@ pub struct MonitorView {
     /// Snap in Program Monitor: graphic drags snap to guides, the frame edges and centre.
     pub snap: bool,
     pub guides: Vec<Guide>,
+    /// VR Video: show an equirectangular (360°) picture as a perspective view to look around in.
+    pub vr: VrView,
+}
+
+/// The VR Video view of a monitor (see `panels::vr_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VrView {
+    pub enabled: bool,
+    /// Where the view looks, degrees: yaw −180…180 (positive = right), pitch −90…90 (positive = up).
+    pub yaw: f32,
+    pub pitch: f32,
+    /// Horizontal field of view, degrees.
+    pub fov: f32,
+}
+
+impl Default for VrView {
+    fn default() -> Self {
+        Self { enabled: false, yaw: 0.0, pitch: 0.0, fov: crate::panels::vr_view::DEFAULT_FOV }
+    }
 }
 
 impl Default for MonitorView {
@@ -366,6 +386,7 @@ impl Default for MonitorView {
             lock_guides: false,
             snap: true,
             guides: Vec::new(),
+            vr: VrView::default(),
         }
     }
 }
@@ -465,6 +486,10 @@ pub struct UiState {
     pub timeline: TimelineView,
     pub program: MonitorView,
     pub source: MonitorView,
+    /// The Source monitor clip the 360° check last ran for (a spherical clip turns VR Video on
+    /// once, when it opens).
+    #[serde(skip)]
+    pub source_vr_auto: Option<filmcraft_project::ItemId>,
     pub project_search: String,
     pub effects_search: String,
     /// Expanded bins in the project list view.
@@ -1021,6 +1046,7 @@ impl Default for UiState {
             timeline: TimelineView::default(),
             program: MonitorView::default(),
             source: MonitorView::default(),
+            source_vr_auto: None,
             project_search: String::new(),
             effects_search: String::new(),
             expanded_bins: vec![],

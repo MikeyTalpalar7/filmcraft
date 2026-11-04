@@ -5,7 +5,8 @@
 //! rulers, guides (dragged out of the rulers, Add
 //! Guide…, Clear Guides, Lock Guides, templates saved in the user preferences), Snap in Program
 //! Monitor (graphic drags snap to guides, the frame edges and center) and Transparency Grid (a
-//! checkerboard behind the picture shows its transparent areas).
+//! checkerboard behind the picture shows its transparent areas) and VR Video (a 360° picture
+//! shown as a view to look around in, see [`super::vr_view`]).
 //!
 //! Everything is [`MonitorView`] state (serde: `ui.inspect`, `ui.set {"program": {…}}`) changed
 //! through the `view.*` UI commands, which [`route`] handles for `menus::invoke`. Commands act on
@@ -150,6 +151,11 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
             let v = view_mut(app, w);
             v.transparency_grid = toggled(v.transparency_grid, params);
             Ok(json!({"monitor": pfx, "transparencyGrid": v.transparency_grid}))
+        }
+        "vrVideo" => {
+            let v = view_mut(app, w);
+            v.vr.enabled = toggled(v.vr.enabled, params);
+            Ok(json!({"monitor": pfx, "vr": v.vr}))
         }
         "showRulers" => {
             let v = view_mut(app, w);
@@ -311,6 +317,7 @@ pub fn checked(app: &FilmcraftApp, id: &str) -> Option<bool> {
         "highQualityPlayback" => Some(v.high_quality),
         "safeMargins" => Some(v.safe_margins),
         "transparencyGrid" => Some(v.transparency_grid),
+        "vrVideo" => Some(v.vr.enabled),
         "showRulers" => Some(v.show_rulers),
         "showGuides" => Some(v.show_guides),
         "lockGuides" => Some(v.lock_guides),
@@ -821,6 +828,7 @@ pub fn wrench_items(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which) {
         pick(ui, &mut out, "snapInProgramMonitor", tl!("Snap in Program Monitor"), v.snap);
     }
     pick(ui, &mut out, "transparencyGrid", tl!("Transparency Grid"), v.transparency_grid);
+    pick(ui, &mut out, "vrVideo", tl!("VR Video"), v.vr.enabled);
     ui.separator();
     let pfx = prefix(w);
     for (key, r, label, clicked) in out {

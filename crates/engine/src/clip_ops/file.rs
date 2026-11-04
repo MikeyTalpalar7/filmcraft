@@ -168,6 +168,7 @@ pub(super) fn offline_file(s: &mut Session, p: &Value) -> Result<Value> {
             bitrate: None,
             hdr: None,
             color_assumed: None,
+            spherical: None,
         }),
         audio_streams: has_a
             .then(|| filmcraft_media::AudioStreamInfo {

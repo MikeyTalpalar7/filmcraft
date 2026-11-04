@@ -444,6 +444,7 @@ impl MkvSource {
                 bitrate,
                 hdr: v.color.as_ref().and_then(hdr_metadata),
                 color_assumed: Some(assumed),
+                spherical: None,
             }
         });
         let audio_streams: Vec<AudioStreamInfo> = atracks.iter().filter_map(|&i| file.tracks.get(i)).filter_map(audio_info).collect();
