@@ -101,6 +101,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     // the monitors' wrench menus only, as in the reference app
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.vrVideo", "VR Video", [], None),
+    uic!("program.vrReframe.toggleKeyframing", "VR Reframe Keyframing: Auto / Manual", [], None),
+    uic!("program.vrReframe.setKeyframe", "Set VR Keyframe", [], Some("Alt+Shift+K")),
     uic!("view.vrVideo.littlePlanet", "Little Planet (Outside In)", [], None),
     uic!("view.vrVideo.rabbitHole", "Rabbit Hole (Inside Out)", [], None),
     uic!("view.safeMargins", "Safe Margins", ["View", "Guide Templates"], None),
@@ -220,6 +222,24 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
     }
     if app.ui.focused == PanelKind::Project && id == "edit.deselectAll" {
         return invoke(app, ctx, "project.deselectAll", params);
+    }
+    // Program monitor VR Reframe aiming: Auto / Manual keyframing, and Set VR Keyframe
+    if id == "program.vrReframe.toggleKeyframing" {
+        app.ui.vr_keyframing_manual = !app.ui.vr_keyframing_manual;
+        return Ok(json!({"manual": app.ui.vr_keyframing_manual}));
+    }
+    if id == "program.vrReframe.setKeyframe" {
+        return crate::panels::vr_reframe_handles::set_keyframe(app, ctx);
+    }
+    // Delete with keyframes selected in Effect Controls deletes them, not the clip
+    if id == "edit.clear"
+        && let Some(keys) = crate::panels::effect_controls::delete_keyframes_params(app)
+    {
+        let r = invoke(app, ctx, "effects.deleteKeyframes", keys);
+        if r.is_ok() {
+            app.ui.keyframe_selection.clear();
+        }
+        return r;
     }
     if id == "edit.selectAll" && (crate::panels::graphics::select_all_edited_text(app) || crate::panels::effect_controls::select_all_keyframes(app)) {
         return Ok(Value::Null);
@@ -1591,5 +1611,45 @@ mod tests {
         harness.run_steps(4);
         assert!(harness.query_by_label_contains("Save All").is_none(), "File menu should close");
         assert!(harness.query_by_label_contains("Undo").is_some(), "Edit menu should open on hover");
+    }
+}
+
+#[cfg(test)]
+mod keyframe_delete_tests {
+    use crate::dock::PanelKind;
+    use crate::state::KeyframeRef;
+    use serde_json::json;
+
+    /// The bug: Delete / Backspace with keyframes selected in Effect Controls ran Clear on the
+    /// selected clip and removed the whole clip. Now it deletes the keyframes, and the clip stays.
+    #[test]
+    fn delete_with_keyframes_selected_deletes_them_not_the_clip() {
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+        s.execute("timeline.select", json!({"clips": [clip.0]})).unwrap();
+        let mut times = Vec::new();
+        for seconds in [0.5, 1.0] {
+            s.execute("playhead.set", json!({"seconds": seconds})).unwrap();
+            s.execute("effects.addKeyframe", json!({"clip": clip.0, "effect": "motion", "param": "scale"})).unwrap();
+            times.push(s.active_sequence().unwrap().find_item(clip).unwrap().1.source_time_at(s.playhead()));
+        }
+        let mut app = crate::FilmcraftApp::new(s);
+        let ctx = egui::Context::default();
+        let effect = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().position(|e| e.effect == "motion").unwrap();
+        let key = |time| KeyframeRef { clip: clip.0, effect, param: "scale".into(), mask: None, time };
+        app.ui.focused = PanelKind::EffectControls;
+        app.ui.keyframe_selection = vec![key(times[0])];
+        super::invoke_command(&mut app, &ctx, "edit.clear", json!({})).unwrap();
+        let it = app.session.active_sequence().unwrap().find_item(clip).map(|(_, it)| it.clone());
+        let it = it.expect("the clip is still there");
+        let scale = &it.effects[effect].params["scale"].keyframes;
+        assert_eq!(scale.iter().map(|k| k.time).collect::<Vec<_>>(), [times[1]]);
+        assert!(app.ui.keyframe_selection.is_empty());
+        // with no keyframes selected (or the Timeline focused) Delete still clears the clip
+        app.ui.keyframe_selection = vec![key(times[1])];
+        app.ui.focused = PanelKind::Timeline;
+        super::invoke_command(&mut app, &ctx, "edit.clear", json!({})).unwrap();
+        assert!(app.session.active_sequence().unwrap().find_item(clip).is_none());
     }
 }

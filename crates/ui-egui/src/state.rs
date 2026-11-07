@@ -460,6 +460,16 @@ pub struct KeyframeRef {
     pub time: filmcraft_time::Tick,
 }
 
+/// A Manual-keyframing aim on the Program monitor that isn't a keyframe yet: the VR Reframe
+/// instance, the playhead it was made at and the undo step (history depth) that shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VrPending {
+    pub clip: u64,
+    pub index: usize,
+    pub time: filmcraft_time::Tick,
+    pub depth: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
@@ -509,6 +519,17 @@ pub struct UiState {
     /// whole clip fits; below 1 counts as 1), and where the view starts (a fraction of the clip).
     #[serde(default)]
     pub effect_controls_zoom: f32,
+    /// Aiming VR Reframe on the Program monitor: Manual keyframing (the aim only previews until
+    /// Set VR Keyframe, ⌥⇧K) instead of Auto (it keyframes at once, and records while playing).
+    #[serde(default)]
+    pub vr_keyframing_manual: bool,
+    /// Effect Controls: the user's order of each effect type's parameters (effect id → parameter
+    /// ids; the rest follow in the effect's own order).
+    #[serde(default)]
+    pub param_order: std::collections::BTreeMap<String, Vec<String>>,
+    /// Manual keyframing: an aim not set as a keyframe yet (the undo step that previews it).
+    #[serde(skip)]
+    pub vr_pending: Option<VrPending>,
     #[serde(default)]
     pub effect_controls_view: f32,
     /// The keyframe area's visible left and right edges this frame (screen x), for rows that
@@ -1059,6 +1080,9 @@ impl Default for UiState {
             collapsed_fx: vec![],
             effect_controls_split: 0.0,
             effect_controls_zoom: 1.0,
+            vr_keyframing_manual: false,
+            param_order: Default::default(),
+            vr_pending: None,
             effect_controls_view: 0.0,
             effect_controls_visible: (0.0, f32::INFINITY),
             show_menu_bar: true,

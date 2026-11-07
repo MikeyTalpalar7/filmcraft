@@ -13,6 +13,8 @@ use crate::state::KeyframeRef;
 use crate::theme::Tokens;
 use crate::widgets::HotNumberOptions;
 
+#[path = "effect_controls_order.rs"]
+pub(crate) mod order;
 #[path = "effect_controls_selection.rs"]
 mod selection;
 #[path = "effect_controls_zoom.rs"]
@@ -64,6 +66,18 @@ fn keyframe_exists(it: &TrackItem, k: &KeyframeRef) -> bool {
         None => e.params.get(&k.param),
     };
     param.is_some_and(|p| p.keyframes.iter().any(|kf| kf.time == k.time))
+}
+
+/// Delete / Backspace (Edit ▸ Clear) with keyframes selected in Effect Controls deletes those
+/// keyframes, not the selected clip (as Premiere does). Only while the Timeline isn't focused, so
+/// a clip clicked there after selecting keyframes is still cleared. The `effects.deleteKeyframes`
+/// parameters, or None to let Clear act on clips.
+pub(crate) fn delete_keyframes_params(app: &FilmcraftApp) -> Option<Value> {
+    if app.ui.keyframe_selection.is_empty() || matches!(app.ui.focused, crate::dock::PanelKind::Timeline | crate::dock::PanelKind::Project) {
+        return None;
+    }
+    let keys: Vec<Value> = app.ui.keyframe_selection.iter().filter_map(|k| serde_json::to_value(k).ok()).collect();
+    (!keys.is_empty()).then(|| json!({"keyframes": keys}))
 }
 
 /// Edit ▸ Select All (⌘A) with Effect Controls focused selects every keyframe the panel shows
@@ -347,7 +361,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
                 }
-                for pd in &def.params {
+                // in the user's order (drag a parameter's name, or right-click it)
+                for pd in order::ordered(app, def) {
                     param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, it, &mut keys);
                     if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
                         && let Some(param) = e.params.get(pd.id)
@@ -670,8 +685,16 @@ pub(crate) fn param_row(
         }
         v
     };
-    let (r, row) = ui.allocate_exact_size(vec2(body.width(), ROW_H), if mask.is_none() { Sense::click() } else { Sense::hover() });
+    let (r, row) = ui.allocate_exact_size(vec2(body.width(), ROW_H), if mask.is_none() { Sense::click_and_drag() } else { Sense::hover() });
     row_line(ui, r, lane, &t);
+    // reordering: drag the row, or its right-click menu
+    if mask.is_none()
+        && let Some(def) = e.def()
+    {
+        let rows = order::rows(ui, clip.0, idx, pd.id, r);
+        order::drag(app, ui, def, pd.id, &row, &rows);
+        row.context_menu(|ui| order::menu(app, ui, def, pd.id));
+    }
     // clicking one of an effect's properties selects the effect, as clicking its header does
     if row.clicked() {
         actions.push(("effects.select".into(), json!({"clip": clip.0, "effect": idx})));

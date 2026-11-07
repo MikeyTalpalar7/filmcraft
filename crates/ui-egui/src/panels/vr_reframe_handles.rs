@@ -17,7 +17,7 @@ use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::FilmcraftApp;
-use crate::state::Tool;
+use crate::state::{Tool, VrPending};
 use crate::theme::Tokens;
 
 const EFFECT: &str = "vr_reframe";
@@ -89,6 +89,8 @@ struct Aim {
     fov: f64,
     /// The drag has sent its first change (the one that starts its undo step).
     begun: bool,
+    /// Auto keyframing while playing: the playhead (ticks) of the last recorded keyframe.
+    recorded: i64,
 }
 
 /// The parameter the wheel zooms in the view's View, and its range.
@@ -122,11 +124,87 @@ pub fn takes_wheel(app: &FilmcraftApp, ui: &egui::Ui, pic: Rect) -> bool {
         && target(app).is_some()
 }
 
+/// Auto keyframing records a drag made while playing at most this often (ticks; a tenth of a
+/// second), and Smooth Motion runs a curve through the keyframes.
+const RECORD_EVERY: i64 = filmcraft_time::TICKS_PER_SECOND / 10;
+/// Manual keyframing: the merge key of the undo step that previews an aim not yet keyframed.
+const PREVIEW_MERGE: &str = "programVrReframePreview";
+
+/// The aim parameters (Pan, Tilt, Roll, Field of View, Planet Field of View) of view A, and of B
+/// with Split Screen on.
+fn aim_params(e: &EffectInstance) -> Vec<&'static str> {
+    let mut ids = vec![VIEW_A.pan, VIEW_A.tilt, VIEW_A.roll, VIEW_A.fov, VIEW_A.planet_fov];
+    if matches!(e.param("split").map(|p| &p.value), Some(filmcraft_project::ParamValue::Choice(1 | 2))) {
+        ids.extend([VIEW_B.pan, VIEW_B.tilt, VIEW_B.roll, VIEW_B.fov]);
+    }
+    ids
+}
+
+fn animated(e: &EffectInstance, id: &str) -> bool {
+    e.param(id).is_some_and(filmcraft_project::Param::is_animated)
+}
+
+/// Manual keyframing: an aim that wasn't set as a keyframe goes away once the playhead leaves
+/// it or playback starts (its undo step is undone, and doesn't linger as a redo). If something
+/// else was edited since, the aim stays as it is.
+fn drop_stale_preview(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let Some(p) = app.ui.vr_pending.clone() else { return };
+    if app.session.history.undo.len() != p.depth {
+        app.ui.vr_pending = None;
+    } else if app.session.playhead() != p.time || app.playback.playing || !app.ui.vr_keyframing_manual {
+        app.ui.vr_pending = None;
+        crate::panels::effect_controls::run(app, ctx, vec![("edit.undo".into(), json!({}))]);
+        app.session.history.redo.pop();
+    }
+}
+
+/// Sequence ▸ Set VR Keyframe (⌥⇧K): keyframes the VR Reframe view under the playhead as it is
+/// shown, at the playhead (its Pan, Tilt, Roll and Fields of View; B's too with Split Screen),
+/// animating the ones that aren't yet. Keeps a Manual-keyframing aim.
+pub fn set_keyframe(app: &mut FilmcraftApp, ctx: &egui::Context) -> Result<Value, String> {
+    let (clip, index, mt) = target(app).ok_or("no VR Reframe under the playhead")?;
+    let e = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned().ok_or("no VR Reframe")?;
+    app.ui.vr_pending = None;
+    let mut actions: Vec<(String, Value)> = Vec::new();
+    let ids = aim_params(&e);
+    for id in &ids {
+        if animated(&e, id) {
+            let v = filmcraft_render::vfx::reframe_value(&e, id, mt);
+            actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": id, "value": v})));
+        } else {
+            actions.push(("effects.toggleAnimation".into(), json!({"clip": clip.0, "effect": index, "param": id})));
+        }
+    }
+    crate::panels::effect_controls::run(app, ctx, actions);
+    Ok(json!({"keyframed": ids}))
+}
+
+/// The angles to send for a drag this frame, or None to skip it: Auto keyframing records a drag
+/// made while playing every [`RECORD_EVERY`] (animating the view's angles when it starts).
+fn record_step(app: &FilmcraftApp, e: &EffectInstance, a: &mut Aim, actions: &mut Vec<(String, Value)>) -> bool {
+    if app.ui.vr_keyframing_manual || !app.playback.playing {
+        return true;
+    }
+    let ph = app.session.playhead().0;
+    if !a.begun {
+        for id in [a.ids.pan, a.ids.tilt, a.ids.roll] {
+            if !animated(e, id) {
+                actions.push(("effects.toggleAnimation".into(), json!({"clip": a.clip.0, "effect": a.index, "param": id})));
+            }
+        }
+    } else if (0..RECORD_EVERY).contains(&(ph - a.recorded)) {
+        return false;
+    }
+    a.recorded = ph;
+    true
+}
+
 /// Drag and wheel input on the Program monitor picture `pic` for VR Reframe.
 pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     if app.ui.tool != Tool::Selection || app.ui.mask_pen.is_some() || app.ui.gfx_edit.is_some() {
         return;
     }
+    drop_stale_preview(app, ui.ctx());
     let Some((clip, index, mt)) = target(app) else { return };
     let Some(e) = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned() else { return };
     let id = egui::Id::unique("program-vr-reframe");
@@ -139,28 +217,35 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     // what the picture shows (Smooth Motion's values between keyframes), so a drag starts there
     let at = |id: &str| filmcraft_render::vfx::reframe_value(&e, id, mt);
     let fov = at(zoom_id);
+    // Manual keyframing previews an aim of an animated view in one undo step until it is set
+    let manual = app.ui.vr_keyframing_manual && aim_params(&e).iter().any(|id| animated(&e, id));
+    let previewing = app.ui.vr_pending.as_ref().is_some_and(|p| (p.clip, p.index) == (clip.0, index));
+    let (aim_merge, zoom_merge) = if manual { (PREVIEW_MERGE, PREVIEW_MERGE) } else { (AIM_MERGE, ZOOM_MERGE) };
     let mut actions: Vec<(String, Value)> = Vec::new();
     let left = egui::PointerButton::Primary;
     if resp.drag_started_by(left) {
         let from = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(pic.center());
-        let aim = Aim { clip, index, ids, width, from, pan: at(ids.pan), tilt: at(ids.tilt), roll: at(ids.roll), fov, begun: false };
+        let aim = Aim { clip, index, ids, width, from, pan: at(ids.pan), tilt: at(ids.tilt), roll: at(ids.roll), fov, begun: false, recorded: i64::MIN };
         ui.data_mut(|d| d.insert_temp(id, aim));
     }
     let aim: Option<Aim> = ui.data(|d| d.get_temp(id)).filter(|a: &Aim| a.clip == clip && a.index == index);
-    if let Some(a) = aim
+    if let Some(mut a) = aim
         && resp.dragged_by(left)
         && resp.drag_delta() != egui::Vec2::ZERO
     {
         let cur = resp.interact_pointer_pos().unwrap_or(a.from);
         let (pan, tilt, roll) = dragged(&a, cur - a.from, ui.input(|i| i.modifiers.alt));
-        let begin = !a.begun;
-        ui.data_mut(|d| d.insert_temp(id, Aim { begun: true, ..a }));
-        for (n, (param, value)) in [(a.ids.pan, pan), (a.ids.tilt, tilt), (a.ids.roll, roll)].into_iter().enumerate() {
-            actions.push((
-                "effects.setParam".into(),
-                json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": AIM_MERGE, "begin": begin && n == 0}),
-            ));
+        // a new undo step, except while adding to a Manual preview
+        let begin = !a.begun && !(manual && previewing);
+        if record_step(app, &e, &mut a, &mut actions) {
+            for (n, (param, value)) in [(a.ids.pan, pan), (a.ids.tilt, tilt), (a.ids.roll, roll)].into_iter().enumerate() {
+                actions.push((
+                    "effects.setParam".into(),
+                    json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": aim_merge, "begin": begin && n == 0}),
+                ));
+            }
         }
+        ui.data_mut(|d| d.insert_temp(id, Aim { begun: true, ..a }));
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -172,17 +257,53 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 && scroll.is_finite() {
             let v = zoomed(fov, scroll, lo, hi);
-            actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": zoom_id, "value": v, "merge": ZOOM_MERGE})));
+            actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": zoom_id, "value": v, "merge": zoom_merge})));
         }
     }
-    // what the picture does, on a backing (the picture under it can be any colour)
-    let t = app.tokens;
-    let hint = crate::i18n::t("VR Reframe: drag to aim, ⌥ drag to roll, scroll to zoom");
-    let galley = ui.painter().layout_no_wrap(hint.to_string(), Tokens::ui(10.0), t.text);
-    let at = pos2(pic.min.x + 8.0, pic.max.y - 6.0 - galley.size().y);
-    ui.painter().rect_filled(Rect::from_min_size(at, galley.size()).expand2(vec2(5.0, 2.0)), 3.0, Color32::from_black_alpha(160));
-    ui.painter().galley(at, galley, t.text);
+    let aimed = !actions.is_empty();
     crate::panels::effect_controls::run(app, ui.ctx(), actions);
+    if manual && aimed {
+        app.ui.vr_pending = Some(VrPending { clip: clip.0, index, time: app.session.playhead(), depth: app.session.history.undo.len() });
+    }
+    hint_and_mode(app, ui, pic);
+}
+
+/// What the picture does (on a backing: the picture under it can be any colour), and the
+/// keyframing chip: Auto / Manual (click to switch), with Set Keyframe while a Manual aim waits.
+/// Automation ids: `program.vrReframe.keyframing`, `program.vrReframe.setKeyframe`.
+fn hint_and_mode(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
+    let t = app.tokens;
+    let chip = |ui: &mut egui::Ui, at: Pos2, text: &str, accent: bool| -> (Rect, egui::Galley) {
+        let g = ui.painter().layout_no_wrap(text.to_string(), Tokens::ui(10.0), if accent { t.hot_text } else { t.text });
+        let r = Rect::from_min_size(at, g.size()).expand2(vec2(5.0, 2.0));
+        ui.painter().rect_filled(r, 3.0, Color32::from_black_alpha(170));
+        (r, (*g).clone())
+    };
+    let hint = crate::i18n::t("VR Reframe: drag to aim, ⌥ drag to roll, scroll to zoom");
+    let y = pic.max.y - 6.0 - 13.0;
+    let (_, g) = chip(ui, pos2(pic.min.x + 8.0, y), hint, false);
+    ui.painter().galley(pos2(pic.min.x + 8.0, y), g.into(), t.text);
+    let mode = if app.ui.vr_keyframing_manual { tl!("Keyframes: Manual") } else { tl!("Keyframes: Auto") };
+    let mw = ui.painter().layout_no_wrap(mode.to_string(), Tokens::ui(10.0), t.text).size().x;
+    let mat = pos2(pic.max.x - 13.0 - mw, y);
+    let (mr, g) = chip(ui, mat, mode, app.ui.vr_keyframing_manual);
+    ui.painter().galley(mat, g.into(), t.text);
+    let tip = tl!("Auto: aiming sets keyframes at once and records while playing. Manual: aiming only previews until Set VR Keyframe (⌥⇧K).");
+    if ui.interact(mr, egui::Id::unique("vr-keyframing-mode"), Sense::click()).on_hover_text(tip).clicked() {
+        app.ui.vr_keyframing_manual = !app.ui.vr_keyframing_manual;
+    }
+    app.auto.add("program.vrReframe.keyframing", mr, mode);
+    if app.ui.vr_pending.is_some() {
+        let set = tl!("Set Keyframe ⌥⇧K");
+        let sw = ui.painter().layout_no_wrap(set.to_string(), Tokens::ui(10.0), t.text).size().x;
+        let sat = pos2(mr.min.x - 14.0 - sw, y);
+        let (sr, g) = chip(ui, sat, set, true);
+        ui.painter().galley(sat, g.into(), t.hot_text);
+        if ui.interact(sr, egui::Id::unique("vr-set-keyframe"), Sense::click()).clicked() {
+            let _ = set_keyframe(app, ui.ctx());
+        }
+        app.auto.add("program.vrReframe.setKeyframe", sr, set);
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +311,19 @@ mod tests {
     use super::*;
 
     fn aim() -> Aim {
-        Aim { clip: ClipId(1), index: 0, ids: VIEW_A, width: 200.0, from: pos2(0.0, 0.0), pan: 170.0, tilt: 10.0, roll: 0.0, fov: 100.0, begun: false }
+        Aim {
+            clip: ClipId(1),
+            index: 0,
+            ids: VIEW_A,
+            width: 200.0,
+            from: pos2(0.0, 0.0),
+            pan: 170.0,
+            tilt: 10.0,
+            roll: 0.0,
+            fov: 100.0,
+            begun: false,
+            recorded: i64::MIN,
+        }
     }
 
     #[test]
