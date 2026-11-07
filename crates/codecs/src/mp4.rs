@@ -268,12 +268,19 @@ impl Mp4Source {
 
     /// Open from a random-access reader: only the index is read now, samples on demand.
     pub fn open_reader(name: &str, reader: filmcraft_media::SharedReader) -> crate::Result<Self> {
+        Self::open_reader_video(name, reader, 0)
+    }
+
+    /// [`Mp4Source::open_reader`] showing the `nth` playable video track (0: the first) instead of
+    /// the first; the audio streams are the same. A file with fewer video tracks opens without
+    /// video (an error when it has no audio either).
+    pub fn open_reader_video(name: &str, reader: filmcraft_media::SharedReader, nth: usize) -> crate::Result<Self> {
         let bytes = crate::Src(reader);
         let mut file = filmcraft_isobmff::open(&bytes).map_err(|e| CodecError::Container(e.to_string()))?;
         // A track needs samples, a sample description and a timescale to be playable (damaged
         // files can lack them: indexing `entries[0]` or dividing by the timescale used to panic).
         let playable = |t: &&filmcraft_isobmff::Track, kind| t.kind == kind && !t.samples.is_empty() && !t.entries.is_empty() && t.timescale > 0;
-        let vtrack = file.tracks.iter().position(|t| playable(&t, TrackKind::Video));
+        let vtrack = file.tracks.iter().enumerate().filter(|(_, t)| playable(t, TrackKind::Video)).map(|(i, _)| i).nth(nth);
         // every audio track is a stream (the track count comes from the file: capped)
         let atracks: Vec<usize> =
             file.tracks.iter().enumerate().filter(|(_, t)| playable(t, TrackKind::Audio)).map(|(i, _)| i).take(filmcraft_media::MAX_AUDIO_STREAMS).collect();

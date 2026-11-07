@@ -60,7 +60,8 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     let playing = if which == Which::Program { app.playback.playing } else { app.source_playback.clock.playing };
     let res = mv.effective_res(playing);
     // frame pixels per screen pixel along the axis that needs the most of them
-    let screen_scale = (pic.width() * ppp / frame_size.0.max(1) as f32).max(pic.height() * ppp / frame_size.1.max(1) as f32).min(1.0);
+    let screen_scale = (pic.width() * ppp / frame_size.0.max(1) as f32).max(pic.height() * ppp / frame_size.1.max(1) as f32);
+    let screen_scale = (screen_scale * crate::panels::vr_view::detail_zoom(&mv.vr, !compare)).min(1.0);
     let scale = quantize_scale(res.scale().min(screen_scale.max(1.0 / 32.0)));
     let frame = rate.frame_at(time);
     let rev = match target {

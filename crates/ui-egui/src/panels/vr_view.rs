@@ -135,6 +135,15 @@ pub fn mesh(tex: TextureId, rect: Rect, view: &VrView, eye: [f32; 4]) -> Mesh {
     m
 }
 
+/// How much more detail of the frame the view needs than a picture of the whole frame the same
+/// size: it spreads `fov` of the frame's 360° across the picture (1 when off, or `shown` is false).
+pub fn detail_zoom(view: &VrView, shown: bool) -> f32 {
+    if !(view.enabled && shown) || !view.fov.is_finite() {
+        return 1.0;
+    }
+    (360.0 / view.fov.max(1.0)).max(1.0)
+}
+
 /// A wide view looking straight down (`up` false: a little planet, the scene seen from outside)
 /// or straight up (a rabbit hole, seen from inside), keeping the heading.
 pub fn planet(view: &VrView, up: bool) -> VrView {
