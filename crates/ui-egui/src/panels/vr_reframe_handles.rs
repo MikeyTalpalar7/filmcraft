@@ -2,6 +2,8 @@
 //! ⌥/Alt, to roll it), scroll to change its field of view (the Planet Field of View in the Little
 //! Planet and Rabbit Hole views).
 //!
+//! With Split Screen on, the drag and the wheel aim the view under the pointer (A or B).
+//!
 //! It acts on the selected effect when that is VR Reframe, and with no effect selected on the
 //! topmost clip under the playhead that has one. The values go through `effects.setParam`, so a
 //! parameter with keyframes gets a keyframe at the playhead and one that has none a new value; a
@@ -40,11 +42,46 @@ fn target(app: &FilmcraftApp) -> Option<(ClipId, usize, Tick)> {
     })
 }
 
+/// The parameters of one of VR Reframe's views: View, Pan, Tilt, Roll, Field of View and the
+/// Planet Field of View.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ids {
+    view: &'static str,
+    pan: &'static str,
+    tilt: &'static str,
+    roll: &'static str,
+    fov: &'static str,
+    planet_fov: &'static str,
+}
+const VIEW_A: Ids = Ids { view: "view", pan: "pan", tilt: "tilt", roll: "roll", fov: "fov", planet_fov: "planet_fov" };
+const VIEW_B: Ids = Ids { view: "view2", pan: "pan2", tilt: "tilt2", roll: "roll2", fov: "fov2", planet_fov: "fov2" };
+
+/// The view under `pos` on the picture `pic` and the width (points) it fills: A, or with Split
+/// Screen on, the one whose part of the frame it is.
+fn view_at(e: &EffectInstance, mt: Tick, pic: Rect, pos: Pos2) -> (Ids, f32) {
+    use filmcraft_render::vfx::{reframe_choice, reframe_value};
+    let axis = match e.param("split").map(|p| &p.value) {
+        Some(filmcraft_project::ParamValue::Choice(a @ (1 | 2))) => *a,
+        _ => return (VIEW_A, pic.width()),
+    };
+    let at = (reframe_value(e, "split_position", mt) / 100.0).clamp(0.05, 0.95) as f32;
+    let along = if axis == 1 { (pos.y - pic.min.y) / pic.height().max(1.0) } else { (pos.x - pic.min.x) / pic.width().max(1.0) };
+    let first = along < at;
+    // mid-swap, the order it is heading to
+    let (from, to, f) = reframe_choice(e, "split_order", mt, 0);
+    let b_first = (if f >= 0.5 { to } else { from }) == 1;
+    let ids = if first != b_first { VIEW_A } else { VIEW_B };
+    let width = if axis == 1 { pic.width() } else { pic.width() * if first { at } else { 1.0 - at } };
+    (ids, width)
+}
+
 /// Where a drag started and the view's angles then.
 #[derive(Clone, Copy, Debug)]
 struct Aim {
     clip: ClipId,
     index: usize,
+    ids: Ids,
+    width: f32,
     from: Pos2,
     pan: f64,
     tilt: f64,
@@ -54,16 +91,17 @@ struct Aim {
     begun: bool,
 }
 
-/// The parameter the wheel zooms in the instance's View, and its range.
-fn zoom_param(e: &EffectInstance, mt: Tick) -> (&'static str, f64, f64) {
+/// The parameter the wheel zooms in the view's View, and its range.
+fn zoom_param(e: &EffectInstance, mt: Tick, ids: Ids) -> (&'static str, f64, f64) {
     // mid-morph between views, the one it is heading to
-    let (from, to, f) = filmcraft_render::vfx::reframe_choice(e, "view", mt, 0);
-    if (if f > 0.0 { to } else { from }) == 0 { ("fov", 10.0, 360.0) } else { ("planet_fov", 90.0, 360.0) }
+    let (from, to, f) = filmcraft_render::vfx::reframe_choice(e, ids.view, mt, 0);
+    if (if f > 0.0 { to } else { from }) == 0 || ids.fov == ids.planet_fov { (ids.fov, 10.0, 360.0) } else { (ids.planet_fov, 90.0, 360.0) }
 }
 
 /// The new angles after a drag of `moved` points across a picture `width` points wide: the
 /// picture follows the pointer (dragging left looks right), by the field of view per width.
-fn dragged(a: &Aim, moved: egui::Vec2, width: f32, roll: bool) -> (f64, f64, f64) {
+fn dragged(a: &Aim, moved: egui::Vec2, roll: bool) -> (f64, f64, f64) {
+    let width = a.width;
     let per = if width > 0.0 { a.fov / f64::from(width) } else { 0.0 };
     let (dx, dy) = (f64::from(moved.x) * per, f64::from(moved.y) * per);
     let wrap = |v: f64| if v.is_finite() { (v + 180.0).rem_euclid(360.0) - 180.0 } else { 0.0 };
@@ -94,7 +132,10 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     let id = egui::Id::unique("program-vr-reframe");
     let resp = ui.interact(pic, id, Sense::drag());
     app.auto.add("program.vrReframe", pic, "VR Reframe: drag to aim");
-    let (zoom_id, lo, hi) = zoom_param(&e, mt);
+    // the view under the pointer (a drag keeps the one it started on)
+    let pointer = ui.input(|i| i.pointer.press_origin().filter(|_| resp.drag_started()).or(i.pointer.hover_pos())).unwrap_or(pic.center());
+    let (ids, width) = view_at(&e, mt, pic, pointer);
+    let (zoom_id, lo, hi) = zoom_param(&e, mt, ids);
     // what the picture shows (Smooth Motion's values between keyframes), so a drag starts there
     let at = |id: &str| filmcraft_render::vfx::reframe_value(&e, id, mt);
     let fov = at(zoom_id);
@@ -102,7 +143,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     let left = egui::PointerButton::Primary;
     if resp.drag_started_by(left) {
         let from = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(pic.center());
-        let aim = Aim { clip, index, from, pan: at("pan"), tilt: at("tilt"), roll: at("roll"), fov, begun: false };
+        let aim = Aim { clip, index, ids, width, from, pan: at(ids.pan), tilt: at(ids.tilt), roll: at(ids.roll), fov, begun: false };
         ui.data_mut(|d| d.insert_temp(id, aim));
     }
     let aim: Option<Aim> = ui.data(|d| d.get_temp(id)).filter(|a: &Aim| a.clip == clip && a.index == index);
@@ -111,13 +152,13 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
         && resp.drag_delta() != egui::Vec2::ZERO
     {
         let cur = resp.interact_pointer_pos().unwrap_or(a.from);
-        let (pan, tilt, roll) = dragged(&a, cur - a.from, pic.width(), ui.input(|i| i.modifiers.alt));
+        let (pan, tilt, roll) = dragged(&a, cur - a.from, ui.input(|i| i.modifiers.alt));
         let begin = !a.begun;
         ui.data_mut(|d| d.insert_temp(id, Aim { begun: true, ..a }));
-        for (param, value) in [("pan", pan), ("tilt", tilt), ("roll", roll)] {
+        for (n, (param, value)) in [(a.ids.pan, pan), (a.ids.tilt, tilt), (a.ids.roll, roll)].into_iter().enumerate() {
             actions.push((
                 "effects.setParam".into(),
-                json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": AIM_MERGE, "begin": begin && param == "pan"}),
+                json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": AIM_MERGE, "begin": begin && n == 0}),
             ));
         }
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -149,23 +190,45 @@ mod tests {
     use super::*;
 
     fn aim() -> Aim {
-        Aim { clip: ClipId(1), index: 0, from: pos2(0.0, 0.0), pan: 170.0, tilt: 10.0, roll: 0.0, fov: 100.0, begun: false }
+        Aim { clip: ClipId(1), index: 0, ids: VIEW_A, width: 200.0, from: pos2(0.0, 0.0), pan: 170.0, tilt: 10.0, roll: 0.0, fov: 100.0, begun: false }
     }
 
     #[test]
     fn dragging_follows_the_pointer_and_wraps() {
         // a whole picture width to the left turns the view right by its field of view (and wraps)
-        let (pan, tilt, roll) = dragged(&aim(), vec2(-200.0, 0.0), 200.0, false);
+        let (pan, tilt, roll) = dragged(&aim(), vec2(-200.0, 0.0), false);
         assert!((pan - -90.0).abs() < 1e-9 && tilt == 10.0 && roll == 0.0, "{pan}");
         // down looks up; tilt stops at ±180°
-        let (_, tilt, _) = dragged(&aim(), vec2(0.0, 1e6), 200.0, false);
+        let (_, tilt, _) = dragged(&aim(), vec2(0.0, 1e6), false);
         assert_eq!(tilt, 180.0);
         // ⌥ rolls instead
-        let (pan, _, roll) = dragged(&aim(), vec2(50.0, 0.0), 200.0, true);
+        let (pan, _, roll) = dragged(&aim(), vec2(50.0, 0.0), true);
         assert!(pan == 170.0 && (roll - 25.0).abs() < 1e-9);
         // hostile sizes and values
-        let (pan, tilt, roll) = dragged(&Aim { pan: f64::NAN, fov: f64::INFINITY, ..aim() }, vec2(f32::NAN, 3.0), 0.0, false);
+        let (pan, tilt, roll) = dragged(&Aim { pan: f64::NAN, fov: f64::INFINITY, width: 0.0, ..aim() }, vec2(f32::NAN, 3.0), false);
         assert!(pan.is_finite() && tilt.is_finite() && roll.is_finite());
+    }
+
+    #[test]
+    fn split_screens_aim_the_view_under_the_pointer() {
+        let mut e = filmcraft_project::find_effect("vr_reframe").unwrap().instance();
+        let pic = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        let (top, bottom) = (pos2(200.0, 20.0), pos2(200.0, 180.0));
+        // no split: always A, the whole width
+        assert_eq!(view_at(&e, Tick::ZERO, pic, bottom), (VIEW_A, 400.0));
+        e.params.insert("split".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Choice(1)));
+        assert_eq!(view_at(&e, Tick::ZERO, pic, top).0, VIEW_A);
+        assert_eq!(view_at(&e, Tick::ZERO, pic, bottom).0, VIEW_B);
+        // swapped
+        e.params.insert("split_order".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Choice(1)));
+        assert_eq!(view_at(&e, Tick::ZERO, pic, top).0, VIEW_B);
+        // side by side, divider at 25%: the left view is a quarter of the width
+        e.params.insert("split".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Choice(2)));
+        e.params.insert("split_position".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(25.0)));
+        assert_eq!(view_at(&e, Tick::ZERO, pic, pos2(50.0, 100.0)), (VIEW_B, 100.0));
+        assert_eq!(view_at(&e, Tick::ZERO, pic, pos2(300.0, 100.0)), (VIEW_A, 300.0));
+        // B's wheel zooms its own Field of View, in every View
+        assert_eq!(zoom_param(&e, Tick::ZERO, VIEW_B).0, "fov2");
     }
 
     #[test]

@@ -3803,6 +3803,42 @@ fn build() -> Vec<CommandSpec> {
             })?;
             Ok(Value::Null)
         }),
+        // Every animatable parameter of one effect at once: animate the ones that aren't yet (a
+        // keyframe at the playhead, keeping the animated ones as they are), or, when all of them
+        // already are, stop animating them all (each keeping its value at the playhead). One undo
+        // step. Returns whether they are animated now and how many parameters it changed.
+        cmd!("effects.toggleAnimationAll", "Toggle Animation of All Parameters", [], None, r#"{"clip":id,"effect":str|index}"#, has_seq, |s, p| {
+            let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleAnimationAll", "need `clip`"))?;
+            let eff = p.get("effect").cloned().unwrap_or(json!("motion"));
+            let ph = s.playhead();
+            let mut out = (false, 0usize);
+            s.edit_sequence("Toggle Animation", |q, _, _| {
+                let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                let mt = it.effect_time_at(ph.clamp(it.start, (it.end() - Tick(1)).max(it.start)));
+                let e = match &eff {
+                    Value::Number(n) => n.as_u64().and_then(|n| usize::try_from(n).ok()).and_then(|n| it.effects.get_mut(n)),
+                    Value::String(sid) => it.effects.iter_mut().find(|e| &e.effect == sid),
+                    _ => None,
+                }
+                .ok_or_else(|| bad("effects.toggleAnimationAll", "no such effect"))?;
+                let def = e.def().ok_or_else(|| bad("effects.toggleAnimationAll", "unknown effect"))?;
+                let ids: Vec<(&str, ParamValue)> = def.params.iter().filter(|d| d.animatable).map(|d| (d.id, d.default.clone())).collect();
+                if ids.is_empty() {
+                    return Err(bad("effects.toggleAnimationAll", "the effect has no animatable parameters"));
+                }
+                let animate = ids.iter().any(|(id, _)| !e.params.get(*id).is_some_and(filmcraft_project::Param::is_animated));
+                for (id, default) in ids {
+                    let param = e.params.entry(id.to_string()).or_insert_with(|| filmcraft_project::Param::new(default));
+                    if param.is_animated() != animate {
+                        param.toggle_animation(mt);
+                        out.1 += 1;
+                    }
+                }
+                out.0 = animate;
+                Ok(())
+            })?;
+            Ok(json!({"animated": out.0, "changed": out.1}))
+        }),
         cmd!("effects.toggleEnabled", "Toggle Effect", [], None, r#"{"clip":id,"index":n}"#, has_seq, |s, p| {
             let c = clip_p(p, "clip").ok_or_else(|| bad("effects.toggleEnabled", "need `clip`"))?;
             let idx = u64_p(p, "index").unwrap_or(0) as usize;

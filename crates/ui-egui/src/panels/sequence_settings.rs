@@ -56,6 +56,39 @@ const TIMEBASES: [(i64, i64); 15] = [
     (120_000, 1001),
     (120, 1),
 ];
+/// A new sequence's timebase: 30 frames per second.
+const NEW_SEQUENCE_RATE: FrameRate = FrameRate { num: 30, den: 1 };
+
+/// Frame Size presets: name and size. The landscape ones turn upright with the Vertical tick
+/// box; the upright ones (taller than wide) are made for phones and stay upright.
+struct FramePreset {
+    name: &'static str,
+    w: u32,
+    h: u32,
+}
+const FRAME_PRESETS: [FramePreset; 9] = [
+    FramePreset { name: "HD 1080p", w: 1920, h: 1080 },
+    FramePreset { name: "HD 720p", w: 1280, h: 720 },
+    FramePreset { name: "2K DCI", w: 2048, h: 1080 },
+    FramePreset { name: "2K QHD 1440p", w: 2560, h: 1440 },
+    FramePreset { name: "4K UHD", w: 3840, h: 2160 },
+    FramePreset { name: "4K DCI", w: 4096, h: 2160 },
+    FramePreset { name: "Square 1:1", w: 1080, h: 1080 },
+    FramePreset { name: "Instagram Portrait 4:5", w: 1080, h: 1350 },
+    FramePreset { name: "Vertical 9:16 (Reels, Shorts, TikTok)", w: 1080, h: 1920 },
+];
+
+/// The preset a frame size is (either way up), if any.
+fn frame_preset(w: u32, h: u32) -> Option<&'static FramePreset> {
+    FRAME_PRESETS.iter().find(|p| (p.w, p.h) == (w, h)).or_else(|| FRAME_PRESETS.iter().find(|p| (p.h, p.w) == (w, h)))
+}
+
+/// The size picking `p` gives, upright when `vertical` (a square stays square).
+fn preset_size(p: &FramePreset, vertical: bool) -> (u32, u32) {
+    let (long, short) = (p.w.max(p.h), p.w.min(p.h));
+    if vertical { (short, long) } else { (long, short) }
+}
+
 const SAMPLE_RATES: [u32; 5] = [32_000, 44_100, 48_000, 88_200, 96_000];
 const MIXES: [&str; 4] = ["Stereo", "Mono", "5.1", "Adaptive"];
 
@@ -98,7 +131,7 @@ pub fn open(app: &mut FilmcraftApp) {
 /// File ▸ New ▸ Sequence…: the dialog as New Sequence, from the default settings, named like
 /// `file.newSequence` would name it, with three video and three audio tracks.
 pub fn open_new(app: &mut FilmcraftApp) {
-    let st = SequenceSettings::default();
+    let st = SequenceSettings { frame_rate: NEW_SEQUENCE_RATE, ..SequenceSettings::default() };
     let n = app.session.project.sequences().count() + 1;
     app.ui.sequence_settings = SequenceSettingsDraft {
         tab: "general".into(),
@@ -255,6 +288,35 @@ fn changes(d: &SequenceSettingsDraft, cur: &SequenceSettings, cur_name: &str) ->
 
 type Elems = Vec<(String, egui::Rect, String)>;
 
+/// The Preset list (common frame sizes) and the Vertical tick box (upright: the frame's width and
+/// height swapped). Automation ids: `sequenceSettings.preset` (+ `preset.option.<n>` while open),
+/// `sequenceSettings.vertical`.
+fn frame_presets(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, elems: &mut Elems, label_w: f32, list_w: f32) {
+    row(ui, label_w, "Preset:", true, |ui| {
+        let vertical = d.height > d.width;
+        let shown = frame_preset(d.width, d.height).map_or_else(|| t("Custom").to_string(), |p| t(p.name).to_string());
+        let resp = craft_ui::ComboBox::from_id_salt("seq-settings-preset").selected_text(&shown).width(list_w - 90.0).height(f32::INFINITY).show_ui(ui, |ui| {
+            for (n, p) in FRAME_PRESETS.iter().enumerate() {
+                // the phone presets are upright whatever the tick box says
+                let (w, h) = if p.h > p.w { (p.w, p.h) } else { preset_size(p, vertical) };
+                let label = format!("{}  ({w} × {h})", t(p.name));
+                let o = ui.selectable_label((d.width, d.height) == (w, h), &label);
+                if o.clicked() {
+                    (d.width, d.height) = (w, h);
+                }
+                elems.push((format!("sequenceSettings.preset.option.{n}"), o.rect, label));
+            }
+        });
+        elems.push(("sequenceSettings.preset".into(), resp.response.rect, shown));
+        let mut upright = vertical;
+        let v = ui.checkbox(&mut upright, tl!("Vertical"));
+        if upright != vertical {
+            (d.width, d.height) = (d.height, d.width);
+        }
+        elems.push(("sequenceSettings.vertical".into(), v.rect, upright.to_string()));
+    });
+}
+
 /// One labelled row: the label right-aligned in a `label_w` column, then the control.
 fn row<R>(ui: &mut egui::Ui, label_w: f32, label: &str, enabled: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal(|ui| {
@@ -344,6 +406,7 @@ fn general(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, cur: &SequenceSetti
             let ar = ui.label(&a);
             elems.push(("sequenceSettings.aspect".into(), ar.rect, a));
         });
+        frame_presets(ui, d, elems, label_w, list_w);
         let r = ui.checkbox(&mut d.scale_motion, tl!("Scale motion effects proportionally when changing frame size"));
         elems.push(("sequenceSettings.scaleMotion".into(), r.rect, d.scale_motion.to_string()));
         row(ui, label_w, "Pixel Aspect Ratio:", false, |ui| fixed_combo(ui, elems, "par", &par_label(cur.par), list_w, NOT_YET));
@@ -570,6 +633,23 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_presets_turn_upright() {
+        let hd = frame_preset(1920, 1080).unwrap();
+        assert_eq!(preset_size(hd, false), (1920, 1080));
+        assert_eq!(preset_size(hd, true), (1080, 1920));
+        // an upright size is still its preset
+        assert_eq!(frame_preset(2160, 3840).unwrap().name, "4K UHD");
+        assert_eq!(preset_size(frame_preset(1080, 1080).unwrap(), true), (1080, 1080));
+        assert!(frame_preset(1000, 1000).is_none());
+        // every preset is a size a sequence can have
+        for p in &FRAME_PRESETS {
+            assert!(p.w >= 1 && p.h >= 1 && p.w.max(p.h) <= filmcraft_project::MAX_FRAME_SIDE);
+        }
+        assert_eq!(NEW_SEQUENCE_RATE, FrameRate { num: 30, den: 1 });
+        assert!(TIMEBASES.contains(&(30, 1)));
+    }
 
     #[test]
     fn aspect_labels() {

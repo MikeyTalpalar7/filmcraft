@@ -15,7 +15,7 @@ use filmcraft_project::{EffectInstance, Interpolation, Keyframe, Param};
 use filmcraft_time::Tick;
 
 /// Angles that wrap: they take the short way between keyframes.
-const WRAPPING: &[&str] = &["pan", "roll"];
+const WRAPPING: &[&str] = &["pan", "roll", "pan2", "roll2"];
 
 /// Whether the instance moves smoothly through its keyframes (the Smooth Motion checkbox; on by
 /// default and when absent).

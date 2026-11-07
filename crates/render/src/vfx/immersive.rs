@@ -297,6 +297,91 @@ fn morph_dir(x: f64, y: f64, fov: f64, (a, b, f): (Lens, Lens, f64), shape: Shap
     }
 }
 
+/// One VR Reframe view (A, or the split screen's B) at a moment: where it looks, how wide, and
+/// through which lens (or part-way between two).
+struct Cam {
+    r: M3,
+    fov: f64,
+    lenses: (Lens, Lens, f64),
+}
+
+/// The parameter ids of a view: View, Lens, Field of View, Planet Field of View, Pan, Tilt, Roll.
+const CAM_A: [&str; 7] = ["view", "lens", "fov", "planet_fov", "pan", "tilt", "roll"];
+/// The split screen's second view (its Field of View sizes its planets too).
+const CAM_B: [&str; 7] = ["view2", "lens2", "fov2", "fov2", "pan2", "tilt2", "roll2"];
+
+fn cam(e: &EffectInstance, cx: &FxCtx, ids: &[&str; 7]) -> Cam {
+    use super::reframe_motion::{choice_morph, reframe_value};
+    // (keyframe and pasted values are untrusted: reframe_value is always finite)
+    let deg = |id| reframe_value(e, id, cx.t);
+    let [view, lens, fov, planet_fov, pan, tilt, roll] = *ids;
+    let (va, vb, vf) = choice_morph(e, view, cx.t, 0);
+    let ((ta, fa), (tb, fb)) = (view_of(va, deg(fov), deg(planet_fov)), view_of(vb, deg(fov), deg(planet_fov)));
+    let (base_tilt, fov) = (ta + (tb - ta) * vf, fa + (fb - fa) * vf);
+    let r = view_rotation(deg(pan), base_tilt + deg(tilt), deg(roll));
+    let (la, lb, lf) = choice_morph(e, lens, cx.t, 0);
+    Cam { r, fov, lenses: (lens_of(la, deg("curve")), lens_of(lb, deg("curve")), lf) }
+}
+
+/// The colour `cam` sees at (`nx`, `ny`) of its view (x −1…1 across, y scaled the same).
+fn shade(src: &Image, cam: &Cam, shape: Shape, nx: f64, ny: f64) -> [f32; 4] {
+    match morph_dir(nx, ny, cam.fov, cam.lenses, shape) {
+        Some((d, a)) => sample_dir(src, mvec(&cam.r, d)).map(|c| c * a),
+        None => [0.0; 4],
+    }
+}
+
+/// The split screen at a moment: `axis` 1 top and bottom, 2 side by side; the divider at `at`
+/// (0…1 along the axis) softened over `soft` either side; which view is first (`order`: 0 A, 1
+/// B, part-way while they swap).
+struct Split {
+    axis: u32,
+    at: f64,
+    soft: f64,
+    order: (u32, u32, f64),
+}
+
+/// The colour at (`fx`, `fy`), 0…1 across the frame `aspect` (height / width) high, of the
+/// split screen with views `a` and `b`.
+fn split_px(src: &Image, (a, b): (&Cam, &Cam), sp: &Split, shape: Shape, (fx, fy): (f64, f64), aspect: f64) -> [f32; 4] {
+    let along = if sp.axis == 1 { fy } else { fx };
+    let first = if sp.soft > 0.0 {
+        1.0 - f64::from(smoothstep((sp.at - sp.soft) as f32, (sp.at + sp.soft) as f32, along as f32))
+    } else {
+        f64::from(u8::from(along < sp.at))
+    };
+    // a region's own view coordinates: x −1…1 across its width
+    let local = |lo: f64, hi: f64| {
+        let span = (hi - lo).max(1e-6);
+        if sp.axis == 1 {
+            (fx * 2.0 - 1.0, (1.0 - (fy - lo) / span * 2.0) * aspect * span)
+        } else {
+            ((fx - lo) / span * 2.0 - 1.0, (1.0 - fy * 2.0) * aspect / span)
+        }
+    };
+    let mix = |order: u32| {
+        let (c1, c2) = if order == 0 { (a, b) } else { (b, a) };
+        let mut o = [0.0f32; 4];
+        for (cam, lo, hi, w) in [(c1, 0.0, sp.at, first), (c2, sp.at, 1.0, 1.0 - first)] {
+            if w > 0.0 {
+                let (nx, ny) = local(lo, hi);
+                let c = shade(src, cam, shape, nx, ny);
+                for k in 0..4 {
+                    o[k] += c[k] * w as f32;
+                }
+            }
+        }
+        o
+    };
+    let (oa, ob, f) = sp.order;
+    let ca = mix(oa);
+    if f <= 0.0 || oa == ob {
+        return ca;
+    }
+    let cb = mix(ob);
+    [0, 1, 2, 3].map(|k| ca[k] + (cb[k] - ca[k]) * f as f32)
+}
+
 /// VR Reframe: a flat view of the sphere (a normal shot, a wide view, a little planet or a rabbit
 /// hole) that fills the sequence frame (the whole layer without a sequence, and for each eye of
 /// a stereoscopic layout). The layer is centred in the sequence 1:1 by Motion's defaults, so the
@@ -304,14 +389,12 @@ fn morph_dir(x: f64, y: f64, fov: f64, (a, b, f): (Lens, Lens, f64), shape: Shap
 ///
 /// The numbers move through their keyframes as [`super::reframe_motion`] says, and a change of
 /// View or Lens morphs over the time between its keyframes.
+///
+/// Split Screen shows a second view (B, with its own View, Lens, Field of View and aim) under or
+/// beside the first, each filling its part of the frame; the Order can be keyframed to swap them.
 fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
     use super::reframe_motion::{choice_morph, reframe_value};
-    // (keyframe and pasted values are untrusted: a NaN angle would blank the frame)
     let deg = |id| reframe_value(e, id, cx.t);
-    let (va, vb, vf) = choice_morph(e, "view", cx.t, 0);
-    let ((ta, fa), (tb, fb)) = (view_of(va, deg("fov"), deg("planet_fov")), view_of(vb, deg("fov"), deg("planet_fov")));
-    let (base_tilt, fov) = (ta + (tb - ta) * vf, fa + (fb - fa) * vf);
-    let r = view_rotation(deg("pan"), base_tilt + deg("tilt"), deg("roll"));
     let target = match (layout, cx.env) {
         (0, Some(env)) => {
             let (sw, sh) = env.sequence_size();
@@ -320,9 +403,20 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
         }
         _ => None,
     };
-    let (la, lb, lf) = choice_morph(e, "lens", cx.t, 0);
-    let lenses = (lens_of(la, deg("curve")), lens_of(lb, deg("curve")), lf);
+    let a = cam(e, cx, &CAM_A);
     let shape = Shape { twist: deg("twist"), stretch: deg("stretch"), center: deg("planet_size") };
+    let split = match chv(e, "split") {
+        axis @ (1 | 2) => Some((
+            cam(e, cx, &CAM_B),
+            Split {
+                axis,
+                at: (deg("split_position") / 100.0).clamp(0.05, 0.95),
+                soft: (deg("split_feather") / 100.0).clamp(0.0, 0.25),
+                order: choice_morph(e, "split_order", cx.t, 0),
+            },
+        )),
+        _ => None,
+    };
     per_view(img, layout, |v| {
         let src = v.clone();
         let (w, h) = (v.w, v.h);
@@ -330,14 +424,14 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
         let (x0, y0) = ((w as f64 - tw) * 0.5, (h as f64 - th) * 0.5);
         v.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
             for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let nx = ((x as f64 + 0.5 - x0) / tw) * 2.0 - 1.0;
-                let ny = (1.0 - (y as f64 + 0.5 - y0) / th * 2.0) * th / tw;
-                let inside = nx.abs() <= 1.0 && ny.abs() <= th / tw;
-                let o = match morph_dir(nx, ny, fov, lenses, shape) {
-                    Some((d, a)) if inside => sample_dir(&src, mvec(&r, d)).map(|c| c * a),
-                    _ => [0.0; 4],
+                let (fx, fy) = ((x as f64 + 0.5 - x0) / tw, (y as f64 + 0.5 - y0) / th);
+                *px = if !((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)) {
+                    [0.0; 4]
+                } else if let Some((b, sp)) = &split {
+                    split_px(&src, (&a, b), sp, shape, (fx, fy), th / tw)
+                } else {
+                    shade(&src, &a, shape, fx * 2.0 - 1.0, (1.0 - fy * 2.0) * th / tw)
                 };
-                *px = o;
             }
         });
     });

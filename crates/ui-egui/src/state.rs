@@ -505,6 +505,16 @@ pub struct UiState {
     /// share of the panel). Dragging the divider sets it (#643).
     #[serde(default)]
     pub effect_controls_split: f32,
+    /// Effect Controls' keyframe area zoom: how many times the clip's length it is drawn (1 = the
+    /// whole clip fits; below 1 counts as 1), and where the view starts (a fraction of the clip).
+    #[serde(default)]
+    pub effect_controls_zoom: f32,
+    #[serde(default)]
+    pub effect_controls_view: f32,
+    /// The keyframe area's visible left and right edges this frame (screen x), for rows that
+    /// draw in the zoomed lane.
+    #[serde(skip)]
+    pub effect_controls_visible: (f32, f32),
     pub show_menu_bar: bool,
     /// The header bar (Home, Import, Edit, Export, workspaces). An app that embeds FilmCraft can hide it.
     #[serde(default = "shown")]
@@ -1048,6 +1058,9 @@ impl Default for UiState {
             lumetri_grid_folder: None,
             collapsed_fx: vec![],
             effect_controls_split: 0.0,
+            effect_controls_zoom: 1.0,
+            effect_controls_view: 0.0,
+            effect_controls_visible: (0.0, f32::INFINITY),
             show_menu_bar: true,
             show_header: true,
             show_status_bar: true,

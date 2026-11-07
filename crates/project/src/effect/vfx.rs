@@ -35,6 +35,12 @@ pub const VR_VIEWS: &[&str] = &["Custom", "Little Planet (Outside In)", "Rabbit 
 /// Curved (stereographic), Fisheye (equidistant), Mirror Ball (equisolid), Panorama Strip
 /// (cylindrical) and Custom Curve (straight 0% … curved 100%, the Curve parameter).
 pub const VR_LENSES: &[&str] = &["Automatic", "Straight", "Curved", "Fisheye", "Mirror Ball", "Panorama Strip", "Custom Curve"];
+/// VR Reframe's Split: one view, or a second view (B) under or beside the first (A).
+pub const VR_SPLITS: &[&str] = &["Off", "Top and Bottom", "Side by Side"];
+/// VR Reframe's split Order: which view is on top (or on the left). Keyframed, the views swap
+/// with a cross-fade over the time between the keyframes (a Hold keyframe cuts).
+pub const VR_SPLIT_ORDERS: &[&str] = &["A Top / Left, B Bottom / Right", "B Top / Left, A Bottom / Right"];
+const SPLIT_GROUP: &str = "Split Screen";
 /// Easing for the animated Transform presets (Grow, Shrink, Move, Spin).
 pub const EASINGS: &[&str] = &["Linear", "Ease In", "Ease Out", "Ease In and Out"];
 pub const ECHO_OPERATORS: &[&str] = &["Add", "Maximum", "Minimum", "Screen", "Composite In Back", "Composite In Front", "Blend"];
@@ -235,6 +241,17 @@ fn immersive() -> Vec<EffectDef> {
                 fs("planet_size", "Planet Size", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
                 // a smooth camera move through the keyframes (no stop at each one)
                 b("smooth", "Smooth Motion", true),
+                // Split Screen: a second view (B) beside the first, each with its own lens and aim
+                grp(ch("split", "Split", VR_SPLITS, 0), SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("split_order", "Order", VR_SPLIT_ORDERS, 0) }, SPLIT_GROUP),
+                grp(fs("split_position", "Divider Position", 50.0, (5.0, 95.0), (5.0, 95.0), "%", 1), SPLIT_GROUP),
+                grp(fs("split_feather", "Divider Softness", 2.0, (0.0, 25.0), (0.0, 25.0), "%", 1), SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("view2", "View B", VR_VIEWS, 0) }, SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("lens2", "Lens B", VR_LENSES, 0) }, SPLIT_GROUP),
+                grp(fs("fov2", "Field of View B", 100.0, (10.0, 360.0), (10.0, 360.0), "°", 1), SPLIT_GROUP),
+                grp(ang("pan2", "Pan B", 180.0), SPLIT_GROUP),
+                grp(ang("tilt2", "Tilt B", 0.0), SPLIT_GROUP),
+                grp(ang("roll2", "Roll B", 0.0), SPLIT_GROUP),
             ],
         ),
         vr("vr_rotate_sphere", "VR Rotate Sphere", vec![ang("tilt", "Tilt (X Axis)", 0.0), ang("pan", "Pan (Y Axis)", 0.0), ang("roll", "Roll (Z Axis)", 0.0)]),

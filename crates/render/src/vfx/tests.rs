@@ -1712,3 +1712,51 @@ fn view_and_lens_changes_morph_between_keyframes() {
         assert!(crate::vfx::reframe_value(&e, "pan", Tick(t)).is_finite());
     }
 }
+
+#[test]
+fn split_screen_shows_two_views_and_swaps_them() {
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let (blue, green) = (2, 1);
+    let is = |p: [f32; 4], c: usize| p[c] > 0.9 && p[3] > 0.99;
+    let mut e = inst("vr_reframe");
+    // A looks up at the sky, B down at the ground
+    setf(&mut e, "tilt", 80.0);
+    setf(&mut e, "tilt2", -80.0);
+    set(&mut e, "split_feather", ParamValue::Float(0.0));
+    set(&mut e, "split", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 8), blue) && is(o.get(64, 56), green));
+    // the order swaps them
+    set(&mut e, "split_order", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 8), green) && is(o.get(64, 56), blue));
+    // keyframed, half-way the swap is a cross-fade
+    keyed(&mut e, "split_order", &[(0, ParamValue::Choice(0)), (1000, ParamValue::Choice(1))]);
+    let o = run("vr_reframe", &e, &img, &FxCtx { t: Tick(500), ..cx() });
+    let p = o.get(64, 8);
+    assert!((p[1] - 0.5).abs() < 0.05 && (p[2] - 0.5).abs() < 0.05, "{p:?}");
+    // side by side, divider at 25%: the left quarter is A
+    let mut e = inst("vr_reframe");
+    setf(&mut e, "tilt", 80.0);
+    setf(&mut e, "tilt2", -80.0);
+    set(&mut e, "split_feather", ParamValue::Float(0.0));
+    set(&mut e, "split", ParamValue::Choice(2));
+    set(&mut e, "split_position", ParamValue::Float(25.0));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(10, 32), blue) && is(o.get(60, 32), green) && is(o.get(120, 32), green));
+    // a soft divider blends across it; hostile numbers stay finite
+    set(&mut e, "split_feather", ParamValue::Float(25.0));
+    for v in [f64::NAN, -1e9, 1e9] {
+        setf(&mut e, "split_position", v);
+        setf(&mut e, "fov2", v);
+        setf(&mut e, "pan2", v);
+        let o = run("vr_reframe", &e, &img, &cx());
+        assert!(o.px.iter().all(|c| c.is_finite()));
+    }
+}
