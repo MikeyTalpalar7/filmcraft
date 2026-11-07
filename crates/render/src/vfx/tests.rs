@@ -1486,8 +1486,9 @@ fn view_dir_is_rectilinear_then_stereographic_and_continuous() {
         let a = angle(1.0, fov).unwrap();
         assert!((a - fov / 2.0).abs() < 1e-6, "{fov}: {a}");
     }
-    // a pinhole view at 90°: half-way to the edge is atan(0.5)
-    assert!((angle(0.5, 90.0).unwrap() - 0.5f64.atan().to_degrees()).abs() < 1e-9);
+    // a pinhole view while narrow: at 50°, half-way to the edge is atan(tan 25° / 2)
+    let pin = (25.0f64.to_radians().tan() * 0.5).atan().to_degrees();
+    assert!((angle(0.5, 50.0).unwrap() - pin).abs() < 1e-9);
     // stereographic past 180°: half-way is 2·atan(tan(θ/2)/2)
     let half = 2.0 * ((135.0f64 / 2.0).to_radians().tan() / 2.0).atan();
     assert!((angle(0.5, 270.0).unwrap() - half.to_degrees()).abs() < 1e-9);
@@ -1587,5 +1588,127 @@ fn lenses_and_shaping_map_as_specified() {
                 assert!(d.iter().all(|c| c.is_finite()), "{lens:?} {v}");
             }
         }
+    }
+}
+
+/// How much wider than tall a small round shape at `x` (on the horizon) comes out of an Automatic
+/// view `fov` wide: the radial over the sideways magnification there.
+fn edge_stretch(x: f64, fov: f64) -> f64 {
+    use crate::vfx::view_dir;
+    let ang = |x: f64, y: f64| view_dir(x, y, fov).map(|d| d[2].clamp(-1.0, 1.0).acos()).unwrap_or(0.0);
+    let h = 1e-5;
+    let radial = (ang(x + h, 0.0) - ang(x - h, 0.0)) / (2.0 * h);
+    // sideways: the angle subtended across a step up at that point, over the step
+    let (a, b) = (view_dir(x, h, fov).unwrap_or([0.0; 3]), view_dir(x, -h, fov).unwrap_or([0.0; 3]));
+    let side = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0).acos() / (2.0 * h);
+    side / radial
+}
+
+#[test]
+fn automatic_views_keep_people_in_proportion_when_zoomed_out() {
+    // a straight lens at 120° makes shapes at its edge twice as wide; Automatic holds them to 15%
+    for fov in [60.0, 90.0, 110.0, 120.0, 150.0, 179.0] {
+        let s = edge_stretch(1.0, fov);
+        assert!(s > 0.999 && s < 1.151, "{fov}°: {s}");
+    }
+    // past 180° it is stereographic: round things stay round everywhere
+    assert!((edge_stretch(0.9, 270.0) - 1.0).abs() < 1e-3);
+}
+
+fn keyed(e: &mut EffectInstance, id: &str, keys: &[(i64, ParamValue)]) {
+    let mut p = Param::new(keys[0].1.clone());
+    p.keyframes = keys.iter().map(|(t, v)| Keyframe::new(Tick(*t), v.clone())).collect();
+    e.params.insert(id.into(), p);
+}
+
+#[test]
+fn smooth_motion_eases_through_keyframes_without_stopping_or_overshooting() {
+    use crate::vfx::reframe_value;
+    let mut e = inst("vr_reframe");
+    let f = ParamValue::Float;
+    keyed(&mut e, "tilt", &[(0, f(0.0)), (100, f(10.0)), (200, f(30.0)), (300, f(30.0))]);
+    let at = |e: &EffectInstance, t| reframe_value(e, "tilt", Tick(t));
+    // it passes through every keyframe
+    for (t, v) in [(0, 0.0), (100, 10.0), (200, 30.0), (300, 30.0)] {
+        assert!((at(&e, t) - v).abs() < 1e-9, "{t}");
+    }
+    // eases out of the first keyframe (slower than linear at the start)…
+    assert!(at(&e, 10) < 1.0);
+    // …keeps moving through the middle one (no stop: speed either side of it)
+    let speed = |t: i64| at(&e, t + 1) - at(&e, t - 1);
+    assert!(speed(100) > 0.05, "{}", speed(100));
+    // …never goes past a keyframe's value, and holds still on the flat stretch
+    for t in 0..=300 {
+        assert!((-1e-9..=30.0 + 1e-9).contains(&at(&e, t)), "{t}: {}", at(&e, t));
+    }
+    assert!((at(&e, 250) - 30.0).abs() < 1e-9);
+    // a Hold keyframe holds
+    e.params.get_mut("tilt").unwrap().keyframes[1].interp = Interpolation::Hold;
+    assert!((at(&e, 150) - 10.0).abs() < 1e-9);
+    // Smooth Motion off: the keyframes' own (linear) interpolation
+    set(&mut e, "smooth", ParamValue::Bool(false));
+    e.params.get_mut("tilt").unwrap().keyframes[1].interp = Interpolation::Linear;
+    assert!((at(&e, 50) - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn pan_takes_the_short_way_round() {
+    use crate::vfx::reframe_value;
+    for smooth in [true, false] {
+        let mut e = inst("vr_reframe");
+        set(&mut e, "smooth", ParamValue::Bool(smooth));
+        keyed(&mut e, "pan", &[(0, ParamValue::Float(170.0)), (100, ParamValue::Float(-170.0))]);
+        for t in 0..=100 {
+            let v = reframe_value(&e, "pan", Tick(t));
+            assert!((170.0 - 1e-9..=190.0 + 1e-9).contains(&v), "{smooth} {t}: {v}");
+        }
+        assert!((reframe_value(&e, "pan", Tick(50)) - 180.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn view_and_lens_changes_morph_between_keyframes() {
+    use crate::vfx::reframe_choice;
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let mut e = inst("vr_reframe");
+    let c = ParamValue::Choice;
+    keyed(&mut e, "view", &[(0, c(0)), (1000, c(1))]);
+    // half-way the morph is half done (eased), and cuts across a Hold
+    assert_eq!(reframe_choice(&e, "view", Tick(500), 0), (0, 1, 0.5));
+    assert_eq!(reframe_choice(&e, "view", Tick(1000), 0), (1, 1, 0.0));
+    // the picture goes from a level view (sky above the middle) to a planet (ground in the middle)
+    let frame = |e: &EffectInstance, t: i64| run("vr_reframe", e, &img, &FxCtx { t: Tick(t), ..cx() });
+    let o = frame(&e, 0);
+    assert!(o.get(64, 20)[2] > 0.9);
+    let o = frame(&e, 1000);
+    assert!(o.get(64, 32)[1] > 0.9);
+    // mid-way the view is looking down part of the way: more ground than at the start
+    let ground = |o: &Image| (0..64).filter(|&y| o.get(64, y)[1] > 0.5).count();
+    let (g0, g5) = (ground(&frame(&e, 0)), ground(&frame(&e, 500)));
+    assert!(g0 < g5, "{g0} {g5}");
+    e.params.get_mut("view").unwrap().keyframes[0].interp = Interpolation::Hold;
+    assert_eq!(reframe_choice(&e, "view", Tick(500), 0), (0, 0, 0.0));
+    // a lens change morphs too, and every frame of it is finite and opaque in the middle
+    let mut e = inst("vr_reframe");
+    keyed(&mut e, "lens", &[(0, c(1)), (1000, c(4))]);
+    setf(&mut e, "fov", 300.0);
+    for t in [0, 250, 500, 750, 1000] {
+        let o = frame(&e, t);
+        assert!(o.px.iter().all(|v| v.is_finite()) && o.get(64, 32)[3] > 0.99, "{t}");
+    }
+    // hostile keyframes: out-of-range choices, NaN values, unsorted and repeated times
+    let mut e = inst("vr_reframe");
+    keyed(&mut e, "lens", &[(5, c(99)), (5, c(2)), (0, c(u32::MAX))]);
+    keyed(&mut e, "pan", &[(0, ParamValue::Float(f64::NAN)), (0, ParamValue::Float(1e300)), (-9, ParamValue::Float(-1e300))]);
+    for t in [-10, 0, 3, 5, 9] {
+        let o = frame(&e, t);
+        assert!(o.px.iter().all(|v| v.is_finite()), "{t}");
+        assert!(crate::vfx::reframe_value(&e, "pan", Tick(t)).is_finite());
     }
 }

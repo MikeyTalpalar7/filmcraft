@@ -221,8 +221,9 @@ fn immersive() -> Vec<EffectDef> {
             "vr_reframe",
             "VR Reframe",
             vec![
-                ch("view", "View", VR_VIEWS, 0),
-                ch("lens", "Lens", VR_LENSES, 0),
+                // View and Lens animate: a change morphs over the time between keyframes
+                ParamDef { animatable: true, ..ch("view", "View", VR_VIEWS, 0) },
+                ParamDef { animatable: true, ..ch("lens", "Lens", VR_LENSES, 0) },
                 pct("curve", "Curve", 50.0),
                 fs("fov", "Field of View", 100.0, (10.0, 360.0), (10.0, 360.0), "°", 1),
                 fs("planet_fov", "Planet Field of View", 270.0, (90.0, 360.0), (90.0, 360.0), "°", 1),
@@ -232,6 +233,8 @@ fn immersive() -> Vec<EffectDef> {
                 ang("twist", "Twist", 0.0),
                 fs("stretch", "Stretch", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
                 fs("planet_size", "Planet Size", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
+                // a smooth camera move through the keyframes (no stop at each one)
+                b("smooth", "Smooth Motion", true),
             ],
         ),
         vr("vr_rotate_sphere", "VR Rotate Sphere", vec![ang("tilt", "Tilt (X Axis)", 0.0), ang("pan", "Pan (Y Axis)", 0.0), ang("roll", "Roll (Z Axis)", 0.0)]),

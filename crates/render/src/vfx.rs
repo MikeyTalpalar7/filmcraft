@@ -19,6 +19,7 @@ pub(crate) use color::cdl;
 mod distort;
 mod immersive;
 mod lights;
+mod reframe_motion;
 mod stylize;
 mod temporal;
 mod text;
@@ -36,6 +37,7 @@ use crate::image::Image;
 use crate::{RenderOptions, SourceProvider};
 
 pub use immersive::{Lens, MAX_VIEW_FOV, Shape, equirect_uv, lens_dir, rotate as rotate_view, view_dir, view_rotation};
+pub use reframe_motion::{choice_morph as reframe_choice, reframe_value};
 pub use temporal::{StabilizerPath, clear_stabilizer_cache, stabilizer_path};
 
 /// What an effect may know about the clip beyond its own pixels.

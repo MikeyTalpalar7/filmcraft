@@ -92,7 +92,8 @@ pub const MAX_VIEW_FOV: f64 = 359.0;
 /// How a flat view maps the sphere ([`lens_dir`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lens {
-    /// Straight up to 90°, easing into [`Lens::Curve`]`(1.0)` by 180° ([`view_dir`]).
+    /// Straight when narrow, curving just enough to keep shapes in proportion as the view widens,
+    /// and [`Lens::Curve`]`(1.0)` by 180° ([`view_dir`]).
     Auto,
     /// The general perspective projection from a point `d` (0…1) behind the centre of the sphere:
     /// 0 is straight (rectilinear: straight lines stay straight, up to 179°), 1 curved
@@ -121,7 +122,8 @@ pub struct Shape {
 /// runs −1…1 across the view's width, `y` (up) is scaled the same (−h/w…h/w), `fov` is the
 /// horizontal field of view in degrees (1…[`MAX_VIEW_FOV`]).
 ///
-/// Up to 90° this is a rectilinear (pinhole) view. From there to 180° it eases into the
+/// Narrow views are rectilinear (pinhole); as the view widens it curves just enough to keep
+/// shapes near its edge in proportion ([`auto_curve`]), and by 180° it is the
 /// stereographic projection, which reaches the whole sphere but its antipode, so the view keeps
 /// zooming out without running off the picture: pointed at the nadir that is a "little planet"
 /// (outside in), at the zenith a "rabbit hole" (inside out). `None` past the sphere.
@@ -153,7 +155,7 @@ pub fn lens_dir(x: f64, y: f64, fov: f64, lens: Lens, shape: Shape) -> Option<[f
             let edge = 2.0 * (fov * 0.25).to_radians().sin();
             radial(x, y, edge, |rho| ((rho * 0.5) <= 1.0).then(|| 2.0 * (rho * 0.5).asin()))
         }
-        Lens::Auto => general(x, y, fov.min(MAX_VIEW_FOV), f64::from(smoothstep(90.0, 180.0, fov as f32))),
+        Lens::Auto => general(x, y, fov.min(MAX_VIEW_FOV), auto_curve(fov)),
         Lens::Curve(d) => {
             let d = fin(d, 0.0, 1.0);
             // the widest view this curve reaches (2·acos(−d)), less a degree
@@ -162,6 +164,26 @@ pub fn lens_dir(x: f64, y: f64, fov: f64, lens: Lens, shape: Shape) -> Option<[f
         }
     }?;
     Some(center_size(d, shape.center))
+}
+
+/// How much shapes may widen at the edge of an Automatic view: 15% (the ratio of the radial to
+/// the sideways magnification there).
+const AUTO_EDGE_STRETCH: f64 = 1.15;
+
+/// The curve (`d` of [`general`]) of an Automatic view `fov` degrees wide: straight while that
+/// keeps shapes at the view's edge within [`AUTO_EDGE_STRETCH`] (up to about 60°), then just
+/// curved enough to hold them there, and fully curved (stereographic) by 180°.
+///
+/// A straight (rectilinear) view widens shapes at its edge by 1 / cos θ (θ is the angle out from
+/// the view's centre): 41% at 90°, double at 120°, so zooming a straight view out stretches
+/// people near the edges. The general perspective projection widens them by
+/// (1 + d cos θ) / (d + cos θ); the smallest `d` that keeps that within the limit at the edge is
+/// (1 − A cos θ) / (A − cos θ).
+fn auto_curve(fov: f64) -> f64 {
+    let c = (fov.clamp(0.0, 360.0) * 0.5).to_radians().cos();
+    let a = AUTO_EDGE_STRETCH;
+    let natural = if fov >= 180.0 { 1.0 } else { ((1.0 - a * c) / (a - c)).clamp(0.0, 1.0) };
+    natural.max(f64::from(smoothstep(90.0, 180.0, fov as f32)))
 }
 
 /// A radially symmetric lens: `theta` turns the image-plane radius (the view's edge at `edge`)
@@ -226,19 +248,69 @@ pub fn equirect_uv(d: [f64; 3]) -> (f64, f64) {
     (lon / TAU + 0.5, 0.5 - lat / PI)
 }
 
+/// A VR Reframe Lens option.
+fn lens_of(choice: u32, curve: f64) -> Lens {
+    match choice {
+        1 => Lens::Curve(0.0),
+        2 => Lens::Curve(1.0),
+        3 => Lens::Fisheye,
+        4 => Lens::MirrorBall,
+        5 => Lens::Panorama,
+        6 => Lens::Curve(curve / 100.0),
+        _ => Lens::Auto,
+    }
+}
+
+/// A VR Reframe View option's tilt and field of view: Custom, Little Planet (looking straight
+/// down), Rabbit Hole (straight up).
+fn view_of(choice: u32, fov: f64, planet_fov: f64) -> (f64, f64) {
+    match choice {
+        1 => (-90.0, planet_fov),
+        2 => (90.0, planet_fov),
+        _ => (0.0, fov),
+    }
+}
+
+/// The direction seen at (`x`, `y`) part-way (`f` 0…1) through a morph from lens `a` to lens
+/// `b`, and how much of the picture is there (a lens that can't reach the point fades out).
+fn morph_dir(x: f64, y: f64, fov: f64, (a, b, f): (Lens, Lens, f64), shape: Shape) -> Option<(V3, f32)> {
+    if f <= 0.0 || a == b {
+        return lens_dir(x, y, fov, a, shape).map(|d| (d, 1.0));
+    }
+    // a straight lens can't show a view as wide as a planet (it pinches to a point well before
+    // 180°): mid-morph, while the view widens, it curves at least as much as Automatic would
+    let fit = |l: Lens| match l {
+        Lens::Curve(d) => Lens::Curve(d.max(auto_curve(fov))),
+        other => other,
+    };
+    let (a, b) = (fit(a), fit(b));
+    match (lens_dir(x, y, fov, a, shape), lens_dir(x, y, fov, b, shape)) {
+        (Some(da), Some(db)) => {
+            let m = [0, 1, 2].map(|i| da[i] + (db[i] - da[i]) * f);
+            let n = dot(m, m).sqrt();
+            // opposite directions (a quarter of the antipode): take the nearer lens
+            if n < 1e-6 { Some((if f < 0.5 { da } else { db }, 1.0)) } else { Some((m.map(|c| c / n), 1.0)) }
+        }
+        (Some(da), None) => Some((da, (1.0 - f) as f32)),
+        (None, Some(db)) => Some((db, f as f32)),
+        (None, None) => None,
+    }
+}
+
 /// VR Reframe: a flat view of the sphere (a normal shot, a wide view, a little planet or a rabbit
 /// hole) that fills the sequence frame (the whole layer without a sequence, and for each eye of
 /// a stereoscopic layout). The layer is centred in the sequence 1:1 by Motion's defaults, so the
 /// view covers the sequence frame's rectangle in layer pixels and is transparent outside it.
+///
+/// The numbers move through their keyframes as [`super::reframe_motion`] says, and a change of
+/// View or Lens morphs over the time between its keyframes.
 fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
-    // Custom, Little Planet (looking straight down), Rabbit Hole (straight up)
-    let (base_tilt, fov) = match chv(e, "view") {
-        1 => (-90.0, fv(e, "planet_fov", cx)),
-        2 => (90.0, fv(e, "planet_fov", cx)),
-        _ => (0.0, fv(e, "fov", cx)),
-    };
+    use super::reframe_motion::{choice_morph, reframe_value};
     // (keyframe and pasted values are untrusted: a NaN angle would blank the frame)
-    let deg = |id| Some(fv(e, id, cx) as f64).filter(|v| v.is_finite()).unwrap_or(0.0);
+    let deg = |id| reframe_value(e, id, cx.t);
+    let (va, vb, vf) = choice_morph(e, "view", cx.t, 0);
+    let ((ta, fa), (tb, fb)) = (view_of(va, deg("fov"), deg("planet_fov")), view_of(vb, deg("fov"), deg("planet_fov")));
+    let (base_tilt, fov) = (ta + (tb - ta) * vf, fa + (fb - fa) * vf);
     let r = view_rotation(deg("pan"), base_tilt + deg("tilt"), deg("roll"));
     let target = match (layout, cx.env) {
         (0, Some(env)) => {
@@ -248,16 +320,8 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
         }
         _ => None,
     };
-    let fov = fov as f64;
-    let lens = match chv(e, "lens") {
-        1 => Lens::Curve(0.0),
-        2 => Lens::Curve(1.0),
-        3 => Lens::Fisheye,
-        4 => Lens::MirrorBall,
-        5 => Lens::Panorama,
-        6 => Lens::Curve(f64::from(fv(e, "curve", cx)) / 100.0),
-        _ => Lens::Auto,
-    };
+    let (la, lb, lf) = choice_morph(e, "lens", cx.t, 0);
+    let lenses = (lens_of(la, deg("curve")), lens_of(lb, deg("curve")), lf);
     let shape = Shape { twist: deg("twist"), stretch: deg("stretch"), center: deg("planet_size") };
     per_view(img, layout, |v| {
         let src = v.clone();
@@ -269,8 +333,8 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
                 let nx = ((x as f64 + 0.5 - x0) / tw) * 2.0 - 1.0;
                 let ny = (1.0 - (y as f64 + 0.5 - y0) / th * 2.0) * th / tw;
                 let inside = nx.abs() <= 1.0 && ny.abs() <= th / tw;
-                let o = match lens_dir(nx, ny, fov, lens, shape) {
-                    Some(d) if inside => sample_dir(&src, mvec(&r, d)),
+                let o = match morph_dir(nx, ny, fov, lenses, shape) {
+                    Some((d, a)) if inside => sample_dir(&src, mvec(&r, d)).map(|c| c * a),
                     _ => [0.0; 4],
                 };
                 *px = o;

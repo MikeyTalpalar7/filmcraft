@@ -56,7 +56,9 @@ struct Aim {
 
 /// The parameter the wheel zooms in the instance's View, and its range.
 fn zoom_param(e: &EffectInstance, mt: Tick) -> (&'static str, f64, f64) {
-    if e.f64_at("view", mt).round() as i64 == 0 { ("fov", 10.0, 360.0) } else { ("planet_fov", 90.0, 360.0) }
+    // mid-morph between views, the one it is heading to
+    let (from, to, f) = filmcraft_render::vfx::reframe_choice(e, "view", mt, 0);
+    if (if f > 0.0 { to } else { from }) == 0 { ("fov", 10.0, 360.0) } else { ("planet_fov", 90.0, 360.0) }
 }
 
 /// The new angles after a drag of `moved` points across a picture `width` points wide: the
@@ -93,12 +95,14 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     let resp = ui.interact(pic, id, Sense::drag());
     app.auto.add("program.vrReframe", pic, "VR Reframe: drag to aim");
     let (zoom_id, lo, hi) = zoom_param(&e, mt);
-    let fov = e.f64_at(zoom_id, mt);
+    // what the picture shows (Smooth Motion's values between keyframes), so a drag starts there
+    let at = |id: &str| filmcraft_render::vfx::reframe_value(&e, id, mt);
+    let fov = at(zoom_id);
     let mut actions: Vec<(String, Value)> = Vec::new();
     let left = egui::PointerButton::Primary;
     if resp.drag_started_by(left) {
         let from = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(pic.center());
-        let aim = Aim { clip, index, from, pan: e.f64_at("pan", mt), tilt: e.f64_at("tilt", mt), roll: e.f64_at("roll", mt), fov, begun: false };
+        let aim = Aim { clip, index, from, pan: at("pan"), tilt: at("tilt"), roll: at("roll"), fov, begun: false };
         ui.data_mut(|d| d.insert_temp(id, aim));
     }
     let aim: Option<Aim> = ui.data(|d| d.get_temp(id)).filter(|a: &Aim| a.clip == clip && a.index == index);
