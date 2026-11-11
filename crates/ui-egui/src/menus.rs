@@ -336,21 +336,21 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
         let src = src.ok_or("no file clip in the Source monitor")?;
         let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
         let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("clip").to_string();
+        // Insta360 Studio recognises clips by their camera name (VID_…_00_….insv): keep it, in
+        // another folder
+        let name = if matches!(ext.to_ascii_lowercase().as_str(), "insv" | "lrv") { format!("{stem}.{ext}") } else { format!("{stem}_trim.{ext}") };
         let mut p = if params.is_object() { params.clone() } else { json!({}) };
-        return app.pick(
-            crate::native_dialogs::FileDialog::save_as(tl!("Trimmed original"), &[ext.as_str()], &format!("{stem}_trim.{ext}")),
-            move |app, paths| {
-                let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
-                p["path"] = json!(path);
-                let r = app.session.execute("file.exportTrimmedOriginal", p).map_err(|e| e.to_string())?;
-                app.ui.status = tlf!(
-                    "Trimmed without re-encoding: {start}–{end} s (cut on keyframes)",
-                    start = format!("{:.2}", r["start"].as_f64().unwrap_or(0.0)),
-                    end = format!("{:.2}", r["end"].as_f64().unwrap_or(0.0))
-                );
-                Ok(r)
-            },
-        );
+        return app.pick(crate::native_dialogs::FileDialog::save_as(tl!("Trimmed original"), &[ext.as_str()], &name), move |app, paths| {
+            let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+            p["path"] = json!(path);
+            let r = app.session.execute("file.exportTrimmedOriginal", p).map_err(|e| e.to_string())?;
+            app.ui.status = tlf!(
+                "Trimmed without re-encoding: {start}–{end} s (cut on keyframes{insta})",
+                start = format!("{:.2}", r["start"].as_f64().unwrap_or(0.0)),
+                end = format!("{:.2}", r["end"].as_f64().unwrap_or(0.0))
+            );
+            Ok(r)
+        });
     }
     if id == "file.exportFrame" {
         if params.get("target").is_none() {

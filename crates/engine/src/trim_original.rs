@@ -41,7 +41,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(CMD, "the Out point must come after the In point"));
     }
     let r = filmcraft_codecs::mp4::trim::trim_file(std::path::Path::new(src), std::path::Path::new(dst), from, to).map_err(|e| bad(CMD, e.to_string()))?;
-    Ok(json!({"path": dst, "start": r.start, "end": r.end, "bytes": r.bytes}))
+    Ok(json!({"path": dst, "start": r.start, "end": r.end, "bytes": r.bytes, "insta360FrameTimes": r.frame_times_cut}))
 }
 
 #[cfg(test)]

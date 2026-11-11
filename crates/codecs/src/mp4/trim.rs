@@ -28,7 +28,21 @@ pub struct TrimReport {
     pub start: f64,
     pub end: f64,
     pub bytes: u64,
+    /// An Insta360 `inst` box's per-frame times were cut to the kept frames
+    /// ([`super::inst::cut_frames`]); false when the file has none or they weren't recognised.
+    pub frame_times_cut: bool,
 }
+
+/// The first video track's kept frames: [start, end) of how many.
+#[derive(Clone, Copy, Debug)]
+struct Frames {
+    start: usize,
+    end: usize,
+    total: usize,
+}
+
+/// Largest Insta360 `inst` box rewritten (bigger ones are copied as they are).
+const MAX_INST: u64 = 512 << 20;
 
 fn err<T>(m: impl Into<String>) -> Result<T, TreeError> {
     Err(TreeError(m.into()))
@@ -92,7 +106,7 @@ fn video_range(samples: &[Sample], ts: u32, from: f64, to: f64, slack: f64) -> (
 }
 
 /// Pick the samples of every track for `from`…`to` seconds.
-fn choose(file: &filmcraft_isobmff::Mp4File, from: f64, to: f64) -> Result<(Vec<Kept>, f64, f64), TreeError> {
+fn choose(file: &filmcraft_isobmff::Mp4File, from: f64, to: f64) -> Result<(Vec<Kept>, f64, f64, Frames), TreeError> {
     let master = file.tracks.iter().position(|t| t.kind == TrackKind::Video && !t.samples.is_empty()).ok_or(TreeError("no video track".into()))?;
     let m = &file.tracks[master];
     let (s, e) = video_range(&m.samples, m.timescale, from, to, 1e-6);
@@ -117,7 +131,7 @@ fn choose(file: &filmcraft_isobmff::Mp4File, from: f64, to: f64) -> Result<(Vec<
         let has_stss = !t.samples.iter().all(|x| x.is_sync);
         kept.push(Kept { id: t.id, timescale: t.timescale, samples, has_stss });
     }
-    Ok((kept, start, end))
+    Ok((kept, start, end, Frames { start: s, end: e, total: m.samples.len() }))
 }
 
 fn be32(v: u32) -> [u8; 4] {
@@ -290,7 +304,8 @@ pub fn trim_file(src: &Path, dst: &Path, from: f64, to: f64) -> Result<TrimRepor
     f.seek(SeekFrom::Start(moov_off)).map_err(io)?;
     f.read_exact(&mut raw).map_err(io)?;
     let orig = tree::parse(&raw)?;
-    let (kept, start, end) = choose(&file, from, to)?;
+    let (kept, start, end, frames) = choose(&file, from, to)?;
+    let mut frame_times_cut = false;
     // the samples in time order (one chunk each)
     let mut order: Vec<(f64, usize, usize)> = Vec::new();
     for (t, k) in kept.iter().enumerate() {
@@ -342,7 +357,20 @@ pub fn trim_file(src: &Path, dst: &Path, from: f64, to: f64) -> Result<TrimRepor
         }
         // the original's other boxes (camera metadata), then whatever follows its last box
         for &(kind, off, size) in &boxes {
-            if !matches!(&kind, b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide") {
+            if &kind == b"inst" && size <= MAX_INST {
+                // Insta360: the per-frame times follow the kept frames
+                let mut raw = vec![0u8; usize::try_from(size).map_err(|_| TreeError("inst".into()))?];
+                f.seek(SeekFrom::Start(off)).map_err(io)?;
+                f.read_exact(&mut raw).map_err(io)?;
+                let (_, hl, _) = tree::header(&raw, 0, raw.len())?;
+                match super::inst::cut_frames(&raw[hl..], (frames.start, frames.end), frames.total) {
+                    Some(body) => {
+                        out.write_all(&Node::leaf(b"inst", body).to_bytes()).map_err(io)?;
+                        frame_times_cut = true;
+                    }
+                    None => out.write_all(&raw).map_err(io)?,
+                }
+            } else if !matches!(&kind, b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide") {
                 copy(&mut f, &mut out, off, size)?;
             }
         }
@@ -356,7 +384,7 @@ pub fn trim_file(src: &Path, dst: &Path, from: f64, to: f64) -> Result<TrimRepor
     match result {
         Ok(bytes) => {
             std::fs::rename(&tmp, dst).map_err(io)?;
-            Ok(TrimReport { start, end, bytes })
+            Ok(TrimReport { start, end, bytes, frame_times_cut })
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

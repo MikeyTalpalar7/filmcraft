@@ -980,6 +980,7 @@ pub fn reader_opener(name: &str, head: &[u8], reader: &filmcraft_media::SharedRe
     Some(Mp4Source::open_reader(name, reader.clone()).map(|s| Arc::new(s) as SharedSource).map_err(Into::into))
 }
 
+pub mod inst;
 mod spherical;
 pub mod tree;
 pub mod trim;
