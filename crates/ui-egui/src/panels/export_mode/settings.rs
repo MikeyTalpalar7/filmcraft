@@ -674,6 +674,16 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
     });
     row(ui, t, "", |ui| check(ui, reg, "export.video.maxDepth", &mut s.render_at_max_depth, tl!("Render at Maximum Depth")));
     row(ui, t, "", |ui| check(ui, reg, "export.video.maxQuality", &mut s.max_render_quality, tl!("Use Maximum Render Quality")));
+    // 360° metadata for an equirectangular picture (a 2:1 frame)
+    if s.format.is_movie() {
+        let (w, h) = s.frame_size.unwrap_or((seq_w, seq_h));
+        row(ui, t, "", |ui| check(ui, reg, "export.video.vr", &mut s.vr_video, tl!("Video is VR (360°)")));
+        if s.vr_video && u64::from(w) != 2 * u64::from(h) {
+            row(ui, t, "", |ui| {
+                ui.label(egui::RichText::new(tl!("360° video is usually 2:1 (for example 5760 × 2880); this frame isn't.")).color(t.text_dim).size(11.0))
+            });
+        }
+    }
 }
 
 fn audio_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_sr: u32) {

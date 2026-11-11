@@ -218,6 +218,10 @@ impl Format {
     pub fn is_mp4_video(self) -> bool {
         matches!(self, Format::H264 | Format::Hevc | Format::Av1)
     }
+    /// An MPEG-4 / QuickTime movie, which can carry 360° metadata (Video is VR).
+    pub fn is_movie(self) -> bool {
+        matches!(self, Format::H264 | Format::Hevc | Format::Av1 | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
+    }
     /// Whether the file is MPEG-4 rather than QuickTime for `mux`.
     pub fn is_mp4_with(self, mux: Multiplexer) -> bool {
         self == Format::Av1 || (self.is_h26x() && mux == Multiplexer::Mp4)
@@ -354,6 +358,10 @@ pub struct ExportSettings {
     /// Render at Maximum Depth. FilmCraft always composites in 32-bit float, so this changes
     /// nothing; it is kept so presets round-trip.
     pub render_at_max_depth: bool,
+    /// Video is VR: mark an MP4 / MOV as 360° equirectangular video (Spherical Video V2 and V1
+    /// metadata) so players and sites show it as a sphere. For an equirectangular (2:1) picture.
+    #[serde(default)]
+    pub vr_video: bool,
     /// Use Maximum Render Quality: render at full size and scale with an area filter.
     pub max_render_quality: bool,
     pub audio: AudioSettings,
@@ -465,6 +473,7 @@ impl Default for ExportSettings {
             adaptive_bitrate: None,
             keyframe_distance: None,
             render_at_max_depth: false,
+            vr_video: false,
             max_render_quality: false,
             audio: AudioSettings::default(),
             multiplexer: Multiplexer::Mp4,

@@ -525,7 +525,14 @@ impl Exporter {
                 // Upload services and progressive players need the MP4 metadata before media.
                 // The muxer relocates data in bounded chunks and adjusts every sample offset.
                 let w = if self.brand == Brand::Mp4 { mux.finish_faststart() } else { mux.finish() }.map_err(|e| ExportError::Io(e.to_string()))?;
-                (w.finish(&self.settings)?, Vec::new())
+                let mut bytes = w.finish(&self.settings)?;
+                // Video is VR: the 360° metadata goes into the finished file (a file on disk only)
+                if self.settings.vr_video && self.settings.sink.is_none() && self.settings.output_file.is_none() {
+                    let path = std::path::Path::new(&self.settings.path);
+                    filmcraft_codecs::mp4::vr_tag::tag_file(path).map_err(|e| ExportError::Io(format!("Video is VR: {e}")))?;
+                    bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(bytes);
+                }
+                (bytes, Vec::new())
             }
         };
         note_stage(Stage::Finish, finishing.elapsed());

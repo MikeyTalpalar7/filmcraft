@@ -981,6 +981,9 @@ pub fn reader_opener(name: &str, head: &[u8], reader: &filmcraft_media::SharedRe
 }
 
 mod spherical;
+pub mod tree;
+pub mod trim;
+pub mod vr_tag;
 
 #[cfg(test)]
 mod tests;

@@ -60,6 +60,7 @@ pub mod source_monitor;
 pub mod sync;
 pub mod transcript;
 pub mod trim;
+pub mod trim_original;
 pub mod voiceover;
 
 use std::sync::Arc;

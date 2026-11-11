@@ -607,3 +607,35 @@ fn h264_input_converted_ahead_encodes_to_the_same_packets() {
     assert!(!plain.is_empty());
     assert!(plain == encode_all(true), "converting ahead changed the packets");
 }
+
+/// Video is VR: an MP4 (fast start: the media after `moov`) and a MOV come out marked as 360°
+/// equirectangular video, with every sample still where the tables say.
+#[test]
+fn video_is_vr_marks_exports_as_360() {
+    let (p, seq, m) = project();
+    for (format, name) in [(Format::H264, "vr.mp4"), (Format::ProRes, "vr.mov")] {
+        let (plain, vr) = (tmp(&format!("plain-{name}")), tmp(name));
+        export(&p, seq, &ExportSettings { format, path: plain.clone(), ..Default::default() }, &m, &Progress::default()).unwrap();
+        export(&p, seq, &ExportSettings { format, path: vr.clone(), vr_video: true, ..Default::default() }, &m, &Progress::default()).unwrap();
+        let (a, b) = (std::fs::read(&plain).unwrap(), std::fs::read(&vr).unwrap());
+        // FilmCraft reads it back as 360°
+        let src = filmcraft_codecs::open_bytes(name, b.clone().into()).unwrap();
+        let sph = src.info().video.as_ref().and_then(|v| v.spherical).expect("spherical metadata");
+        assert_eq!(sph.projection, filmcraft_media::Projection::Equirectangular, "{name}");
+        // the samples are unchanged and found where the tables say
+        let (fa, fb) = (filmcraft_isobmff::open(a.clone()).unwrap(), filmcraft_isobmff::open(b.clone()).unwrap());
+        for t in 0..fa.tracks.len() {
+            assert_eq!(fa.tracks[t].samples.len(), fb.tracks[t].samples.len());
+            for i in 0..fa.tracks[t].samples.len() {
+                assert_eq!(fa.read_sample(&a[..], t, i).unwrap(), fb.read_sample(&b[..], t, i).unwrap(), "{name} track {t} sample {i}");
+            }
+        }
+        // ffprobe (when present) sees the spherical side data
+        if let Some(ff) = filmcraft_testkit::ffprobe_or_skip("Video is VR") {
+            let out = std::process::Command::new(ff).args(["-v", "error", "-show_streams", "-select_streams", "v:0", &vr]).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            assert!(text.contains("spherical") || text.contains("equirectangular"), "{name}: {text}");
+        }
+        let _ = (std::fs::remove_file(&plain), std::fs::remove_file(&vr));
+    }
+}

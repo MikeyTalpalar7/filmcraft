@@ -1937,6 +1937,15 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             crate::interchange::export
         ),
+        cmd!(
+            "file.exportTrimmedOriginal",
+            "Trimmed Original (No Re-encode)…",
+            ["File", "Export"],
+            None,
+            r#"{"item":id?,"path":str,"in":seconds?,"out":seconds?}"#,
+            crate::trim_original::enabled,
+            crate::trim_original::run
+        ),
         cmd!("file.exportEdl", "EDL…", ["File", "Export"], None, r#"{"path":str}"#, has_seq, |s, p| {
             let mut q = p.clone();
             q["format"] = json!("edl");
