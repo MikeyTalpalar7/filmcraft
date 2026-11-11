@@ -969,6 +969,9 @@ pub struct SequenceSettingsDraft {
     pub working_space: String,
     pub wide_gamut: bool,
     pub auto_tone_map: bool,
+    /// Frame Size's Lock Ratio: the width and height whose ratio editing one side keeps (None:
+    /// unlocked).
+    pub lock_ratio: Option<(u32, u32)>,
 }
 
 impl Default for SequenceSettingsDraft {
@@ -993,6 +996,7 @@ impl Default for SequenceSettingsDraft {
             working_space: "rec709".into(),
             wide_gamut: false,
             auto_tone_map: true,
+            lock_ratio: None,
         }
     }
 }
