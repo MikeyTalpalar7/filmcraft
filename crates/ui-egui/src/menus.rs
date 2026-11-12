@@ -102,7 +102,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.vrVideo", "VR Video", [], None),
     uic!("program.vrReframe.toggleKeyframing", "VR Reframe Keyframing: Auto / Manual", [], None),
-    uic!("program.vrReframe.setKeyframe", "Set VR Keyframe", [], Some("Alt+Shift+K")),
+    uic!("program.vrReframe.setKeyframe", "Set VR Keyframe (All Properties)", [], Some("Alt+Shift+K")),
     uic!("view.vrVideo.littlePlanet", "Little Planet (Outside In)", [], None),
     uic!("view.vrVideo.rabbitHole", "Rabbit Hole (Inside Out)", [], None),
     uic!("view.safeMargins", "Safe Margins", ["View", "Guide Templates"], None),
@@ -497,6 +497,10 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
             return Ok(json!({"speed": app.playback.speed}));
         }
         "playback.stop" => {
+            // K while stopped keyframes the VR Reframe under the playhead (K still stops playback)
+            if !targets_source(app, &params) && !app.playback.playing && crate::panels::vr_reframe_handles::has_target(app) {
+                return crate::panels::vr_reframe_handles::set_keyframe(app, ctx);
+            }
             if targets_source(app, &params) {
                 app.stop_source();
             } else {
@@ -1689,5 +1693,64 @@ mod keyframe_delete_tests {
         app.ui.focused = PanelKind::Timeline;
         super::invoke_command(&mut app, &ctx, "edit.clear", json!({})).unwrap();
         assert!(app.session.active_sequence().unwrap().find_item(clip).is_none());
+    }
+}
+
+#[cfg(test)]
+mod vr_key_all_tests {
+    use filmcraft_project::ParamValue;
+    use serde_json::json;
+
+    /// K while stopped on a VR Reframe clip keyframes every animatable property at the playhead,
+    /// as it is shown there, in one undo step; while playing K only stops.
+    #[test]
+    fn k_when_stopped_keyframes_every_vr_reframe_property() {
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+        s.execute("effects.apply", json!({"clips": [clip.0], "effect": "VR Reframe"})).unwrap();
+        let fx = |s: &filmcraft_engine::Session| {
+            let it = s.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
+            let i = it.effects.iter().position(|e| e.effect == "vr_reframe").unwrap();
+            (it, i)
+        };
+        let index = fx(&s).1;
+        // a static Pan, and a Field of View already moving from 80° to 120°
+        s.execute("effects.setParam", json!({"clip": clip.0, "effect": index, "param": "pan", "value": 40.0})).unwrap();
+        for (seconds, fov) in [(0.5, 80.0), (1.5, 120.0)] {
+            s.execute("playhead.set", json!({"seconds": seconds})).unwrap();
+            s.execute("effects.setParam", json!({"clip": clip.0, "effect": index, "param": "fov", "value": fov, "keyframe": true})).unwrap();
+        }
+        s.execute("playhead.set", json!({"seconds": 1.0})).unwrap();
+        let mut app = crate::FilmcraftApp::new(s);
+        let ctx = egui::Context::default();
+        let (it, _) = fx(&app.session);
+        let mt = it.effect_time_at(app.session.playhead());
+        let fov_shown = filmcraft_render::vfx::reframe_value(&it.effects[index], "fov", mt);
+        let undo = app.session.history.undo.len();
+
+        super::invoke_command(&mut app, &ctx, "playback.stop", json!({})).unwrap();
+        assert_eq!(app.session.history.undo.len(), undo + 1, "one undo step");
+        let (it, _) = fx(&app.session);
+        let e = &it.effects[index];
+        let def = e.def().unwrap();
+        for d in def.params.iter().filter(|d| d.animatable) {
+            let p = e.param(d.id).unwrap_or_else(|| panic!("{} is set", d.id));
+            assert!(p.keyframes.iter().any(|k| k.time == mt), "{} has a keyframe at the playhead", d.id);
+        }
+        let at = |id: &str| e.param(id).unwrap().keyframes.iter().find(|k| k.time == mt).unwrap().value.clone();
+        assert_eq!(at("pan"), ParamValue::Float(40.0));
+        match at("fov") {
+            ParamValue::Float(v) => assert!((v - fov_shown).abs() < 1e-9, "{v} vs {fov_shown}"),
+            v => panic!("{v:?}"),
+        }
+        assert_eq!(at("view"), ParamValue::Choice(0));
+
+        // while playing, K stops and keys nothing
+        app.play(1.0);
+        let undo = app.session.history.undo.len();
+        super::invoke_command(&mut app, &ctx, "playback.stop", json!({})).unwrap();
+        assert!(!app.playback.playing);
+        assert_eq!(app.session.history.undo.len(), undo);
     }
 }

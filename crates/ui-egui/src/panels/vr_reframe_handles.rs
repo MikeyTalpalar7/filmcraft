@@ -26,6 +26,11 @@ const AIM_MERGE: &str = "programVrReframeAim";
 const ZOOM_MERGE: &str = "programVrReframeZoom";
 
 /// The VR Reframe instance the monitor aims: its clip, index and media time at the playhead.
+/// Whether a VR Reframe is under the playhead (what K keyframes while playback is stopped).
+pub(crate) fn has_target(app: &FilmcraftApp) -> bool {
+    target(app).is_some()
+}
+
 fn target(app: &FilmcraftApp) -> Option<(ClipId, usize, Tick)> {
     let seq = app.session.active_sequence()?;
     let t = app.session.playhead();
@@ -158,25 +163,47 @@ fn drop_stale_preview(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Sequence ▸ Set VR Keyframe (⌥⇧K): keyframes the VR Reframe view under the playhead as it is
-/// shown, at the playhead (its Pan, Tilt, Roll and Fields of View; B's too with Split Screen),
-/// animating the ones that aren't yet. Keeps a Manual-keyframing aim.
-pub fn set_keyframe(app: &mut FilmcraftApp, ctx: &egui::Context) -> Result<Value, String> {
+/// Set VR Keyframe (K while stopped, or ⌥⇧K): keyframes every animatable property of the VR
+/// Reframe under the playhead at the playhead, as it is shown there (View, Lens, the angles and
+/// Fields of View, the shaping, Split Screen's B view and Order…), animating the ones that
+/// aren't yet. One undo step. Keeps a Manual-keyframing aim.
+pub fn set_keyframe(app: &mut FilmcraftApp, _ctx: &egui::Context) -> Result<Value, String> {
     let (clip, index, mt) = target(app).ok_or("no VR Reframe under the playhead")?;
     let e = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned().ok_or("no VR Reframe")?;
+    let writes = key_all(&e, mt);
     app.ui.vr_pending = None;
-    let mut actions: Vec<(String, Value)> = Vec::new();
-    let ids = aim_params(&e);
-    for id in &ids {
-        if animated(&e, id) {
-            let v = filmcraft_render::vfx::reframe_value(&e, id, mt);
-            actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": id, "value": v})));
-        } else {
-            actions.push(("effects.toggleAnimation".into(), json!({"clip": clip.0, "effect": index, "param": id})));
-        }
-    }
-    crate::panels::effect_controls::run(app, ctx, actions);
+    let ids: Vec<&str> = writes.iter().map(|(id, _)| *id).collect();
+    app.session
+        .edit_group("Set VR Keyframe", |s| {
+            for (id, value) in &writes {
+                s.execute("effects.setParam", json!({"clip": clip.0, "effect": index, "param": id, "value": value, "keyframe": true}))?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
     Ok(json!({"keyframed": ids}))
+}
+
+/// Every animatable property of VR Reframe `e` with the value it has at media time `mt`, as it
+/// is drawn (a View, Lens or Order change in the middle of its morph counts as the nearer one).
+fn key_all(e: &EffectInstance, mt: Tick) -> Vec<(&'static str, Value)> {
+    use filmcraft_project::ParamValue;
+    let Some(def) = e.def() else { return Vec::new() };
+    def.params
+        .iter()
+        .filter(|d| d.animatable)
+        .filter_map(|d| {
+            let value = match &d.default {
+                ParamValue::Choice(c) => {
+                    let (from, to, f) = filmcraft_render::vfx::reframe_choice(e, d.id, mt, *c);
+                    json!(if f >= 0.5 { to } else { from })
+                }
+                ParamValue::Float(_) => json!(filmcraft_render::vfx::reframe_value(e, d.id, mt)),
+                _ => return None,
+            };
+            Some((d.id, value))
+        })
+        .collect()
 }
 
 /// The angles to send for a drag this frame, or None to skip it: Auto keyframing records a drag
