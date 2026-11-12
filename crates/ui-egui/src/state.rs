@@ -461,13 +461,16 @@ pub struct KeyframeRef {
 }
 
 /// A Manual-keyframing aim on the Program monitor that isn't a keyframe yet: the VR Reframe
-/// instance, the playhead it was made at and the undo step (history depth) that shows it.
+/// instance, the playhead it was last seen at, the undo step (history depth) that shows it, the
+/// aimed values (held still over the keyframes until set) and whether playback was running.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VrPending {
     pub clip: u64,
     pub index: usize,
     pub time: filmcraft_time::Tick,
     pub depth: usize,
+    pub values: Vec<(&'static str, f64)>,
+    pub playing: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

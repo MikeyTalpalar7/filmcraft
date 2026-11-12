@@ -26,11 +26,6 @@ const AIM_MERGE: &str = "programVrReframeAim";
 const ZOOM_MERGE: &str = "programVrReframeZoom";
 
 /// The VR Reframe instance the monitor aims: its clip, index and media time at the playhead.
-/// Whether a VR Reframe is under the playhead (what K keyframes while playback is stopped).
-pub(crate) fn has_target(app: &FilmcraftApp) -> bool {
-    target(app).is_some()
-}
-
 fn target(app: &FilmcraftApp) -> Option<(ClipId, usize, Tick)> {
     let seq = app.session.active_sequence()?;
     let t = app.session.playhead();
@@ -132,8 +127,6 @@ pub fn takes_wheel(app: &FilmcraftApp, ui: &egui::Ui, pic: Rect) -> bool {
 /// Auto keyframing records a drag made while playing at most this often (ticks; a tenth of a
 /// second), and Smooth Motion runs a curve through the keyframes.
 const RECORD_EVERY: i64 = filmcraft_time::TICKS_PER_SECOND / 10;
-/// Manual keyframing: the merge key of the undo step that previews an aim not yet keyframed.
-const PREVIEW_MERGE: &str = "programVrReframePreview";
 
 /// The aim parameters (Pan, Tilt, Roll, Field of View, Planet Field of View) of view A, and of B
 /// with Split Screen on.
@@ -149,29 +142,100 @@ fn animated(e: &EffectInstance, id: &str) -> bool {
     e.param(id).is_some_and(filmcraft_project::Param::is_animated)
 }
 
-/// Manual keyframing: an aim that wasn't set as a keyframe goes away once the playhead leaves
-/// it or playback starts (its undo step is undone, and doesn't linger as a redo). If something
-/// else was edited since, the aim stays as it is.
-fn drop_stale_preview(app: &mut FilmcraftApp, ctx: &egui::Context) {
-    let Some(p) = app.ui.vr_pending.clone() else { return };
+/// The Manual aim waiting to be set on VR Reframe `index` of `clip`, if its undo step is still
+/// the last one.
+fn pending_on(app: &FilmcraftApp, clip: ClipId, index: usize) -> Option<VrPending> {
+    app.ui.vr_pending.clone().filter(|p| (p.clip, p.index) == (clip.0, index) && p.depth == app.session.history.undo.len())
+}
+
+/// Take a Manual aim's undo step back (the keyframes it held still come back), leaving no redo.
+fn undo_preview(app: &mut FilmcraftApp) {
+    if let Some(p) = app.ui.vr_pending.take()
+        && p.depth == app.session.history.undo.len()
+        && app.session.execute("edit.undo", json!({})).is_ok()
+    {
+        app.session.history.redo.pop();
+    }
+}
+
+/// Manual keyframing: an aim that wasn't set as a keyframe stays while playback runs (so the view
+/// can be steered live and set with K) and where playback stops; it goes away when the playhead
+/// is moved while stopped, or keyframing switches to Auto. If something else was edited since,
+/// the aim stays as it is.
+fn drop_stale_preview(app: &mut FilmcraftApp) {
+    let Some(mut p) = app.ui.vr_pending.clone() else { return };
     if app.session.history.undo.len() != p.depth {
         app.ui.vr_pending = None;
-    } else if app.session.playhead() != p.time || app.playback.playing || !app.ui.vr_keyframing_manual {
-        app.ui.vr_pending = None;
-        crate::panels::effect_controls::run(app, ctx, vec![("edit.undo".into(), json!({}))]);
-        app.session.history.redo.pop();
+        return;
+    }
+    let ph = app.session.playhead();
+    if !app.ui.vr_keyframing_manual || (!app.playback.playing && !p.playing && ph != p.time) {
+        undo_preview(app);
+        return;
+    }
+    (p.time, p.playing) = (ph, app.playback.playing);
+    app.ui.vr_pending = Some(p);
+}
+
+/// Show a Manual aim: `set` (and the values aimed before it) held still on VR Reframe `index` of
+/// `clip`, over its keyframes, as one undo step that replaces the previous aim's.
+fn preview(app: &mut FilmcraftApp, clip: ClipId, index: usize, set: &[(&'static str, f64)]) {
+    let mut values = pending_on(app, clip, index).map(|p| p.values).unwrap_or_default();
+    for (id, v) in set {
+        match values.iter_mut().find(|(i, _)| i == id) {
+            Some(slot) => slot.1 = *v,
+            None => values.push((*id, *v)),
+        }
+    }
+    if pending_on(app, clip, index).is_some() {
+        undo_preview(app);
+    }
+    app.ui.vr_pending = None;
+    let Some(e) = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned() else { return };
+    let r = app.session.edit_group("Aim VR Reframe", |s| {
+        for (id, v) in &values {
+            if animated(&e, id) {
+                s.execute("effects.toggleAnimation", json!({"clip": clip.0, "effect": index, "param": id}))?;
+            }
+            s.execute("effects.setParam", json!({"clip": clip.0, "effect": index, "param": id, "value": v}))?;
+        }
+        Ok(())
+    });
+    match r {
+        Ok(()) => {
+            let (time, depth, playing) = (app.session.playhead(), app.session.history.undo.len(), app.playback.playing);
+            app.ui.vr_pending = Some(VrPending { clip: clip.0, index, time, depth, values, playing });
+        }
+        Err(e) => app.ui.status = e.to_string(),
+    }
+}
+
+/// Whether K keyframes rather than stops: playback is stopped on a VR Reframe, or a Manual aim
+/// is waiting to be set (steered while playing).
+pub(crate) fn k_keyframes(app: &FilmcraftApp) -> bool {
+    match target(app) {
+        Some((clip, index, _)) => !app.playback.playing || pending_on(app, clip, index).is_some(),
+        None => false,
     }
 }
 
 /// Set VR Keyframe (K while stopped, or ⌥⇧K): keyframes every animatable property of the VR
 /// Reframe under the playhead at the playhead, as it is shown there (View, Lens, the angles and
 /// Fields of View, the shaping, Split Screen's B view and Order…), animating the ones that
-/// aren't yet. One undo step. Keeps a Manual-keyframing aim.
+/// aren't yet. One undo step. A Manual aim waiting to be set is what gets keyframed (the
+/// keyframes it held still come back first).
 pub fn set_keyframe(app: &mut FilmcraftApp, _ctx: &egui::Context) -> Result<Value, String> {
     let (clip, index, mt) = target(app).ok_or("no VR Reframe under the playhead")?;
+    // a Manual aim: its keyframes come back, and it is keyframed among them
+    let aimed = pending_on(app, clip, index).map(|p| p.values).unwrap_or_default();
+    undo_preview(app);
     let e = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned().ok_or("no VR Reframe")?;
-    let writes = key_all(&e, mt);
-    app.ui.vr_pending = None;
+    let mut writes = key_all(&e, mt);
+    for (id, v) in &aimed {
+        if let Some(w) = writes.iter_mut().find(|(i, _)| i == id) {
+            w.1 = json!(v);
+        }
+    }
     let ids: Vec<&str> = writes.iter().map(|(id, _)| *id).collect();
     app.session
         .edit_group("Set VR Keyframe", |s| {
@@ -231,7 +295,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     if app.ui.tool != Tool::Selection || app.ui.mask_pen.is_some() || app.ui.gfx_edit.is_some() {
         return;
     }
-    drop_stale_preview(app, ui.ctx());
+    drop_stale_preview(app);
     let Some((clip, index, mt)) = target(app) else { return };
     let Some(e) = app.session.active_sequence().and_then(|s| s.find_item(clip)).and_then(|(_, it)| it.effects.get(index)).cloned() else { return };
     let id = egui::Id::unique("program-vr-reframe");
@@ -244,10 +308,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     // what the picture shows (Smooth Motion's values between keyframes), so a drag starts there
     let at = |id: &str| filmcraft_render::vfx::reframe_value(&e, id, mt);
     let fov = at(zoom_id);
-    // Manual keyframing previews an aim of an animated view in one undo step until it is set
-    let manual = app.ui.vr_keyframing_manual && aim_params(&e).iter().any(|id| animated(&e, id));
-    let previewing = app.ui.vr_pending.as_ref().is_some_and(|p| (p.clip, p.index) == (clip.0, index));
-    let (aim_merge, zoom_merge) = if manual { (PREVIEW_MERGE, PREVIEW_MERGE) } else { (AIM_MERGE, ZOOM_MERGE) };
+    // Manual keyframing previews an aim of an animated view, held still over its keyframes,
+    // until it is set (K)
+    let previewing = pending_on(app, clip, index).is_some();
+    let manual = app.ui.vr_keyframing_manual && (previewing || aim_params(&e).iter().any(|id| animated(&e, id)));
+    let mut aimed: Vec<(&'static str, f64)> = Vec::new();
     let mut actions: Vec<(String, Value)> = Vec::new();
     let left = egui::PointerButton::Primary;
     if resp.drag_started_by(left) {
@@ -262,13 +327,14 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     {
         let cur = resp.interact_pointer_pos().unwrap_or(a.from);
         let (pan, tilt, roll) = dragged(&a, cur - a.from, ui.input(|i| i.modifiers.alt));
-        // a new undo step, except while adding to a Manual preview
-        let begin = !a.begun && !(manual && previewing);
-        if record_step(app, &e, &mut a, &mut actions) {
+        let begin = !a.begun;
+        if manual {
+            aimed.extend([(a.ids.pan, pan), (a.ids.tilt, tilt), (a.ids.roll, roll)]);
+        } else if record_step(app, &e, &mut a, &mut actions) {
             for (n, (param, value)) in [(a.ids.pan, pan), (a.ids.tilt, tilt), (a.ids.roll, roll)].into_iter().enumerate() {
                 actions.push((
                     "effects.setParam".into(),
-                    json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": aim_merge, "begin": begin && n == 0}),
+                    json!({"clip": clip.0, "effect": index, "param": param, "value": value, "merge": AIM_MERGE, "begin": begin && n == 0}),
                 ));
             }
         }
@@ -284,13 +350,16 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 && scroll.is_finite() {
             let v = zoomed(fov, scroll, lo, hi);
-            actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": zoom_id, "value": v, "merge": zoom_merge})));
+            if manual {
+                aimed.push((zoom_id, v));
+            } else {
+                actions.push(("effects.setParam".into(), json!({"clip": clip.0, "effect": index, "param": zoom_id, "value": v, "merge": ZOOM_MERGE})));
+            }
         }
     }
-    let aimed = !actions.is_empty();
     crate::panels::effect_controls::run(app, ui.ctx(), actions);
-    if manual && aimed {
-        app.ui.vr_pending = Some(VrPending { clip: clip.0, index, time: app.session.playhead(), depth: app.session.history.undo.len() });
+    if !aimed.is_empty() {
+        preview(app, clip, index, &aimed);
     }
     hint_and_mode(app, ui, pic);
 }
@@ -319,7 +388,7 @@ fn hint_and_mode(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     app.auto.add("program.vrReframe.keyframing", mr, mode);
     let mut left = mr.min.x;
     if app.ui.vr_pending.is_some() {
-        let set = tl!("Set Keyframe ⌥⇧K");
+        let set = tl!("Set Keyframe (K)");
         let sw = ui.painter().layout_no_wrap(set.to_string(), Tokens::ui(10.0), t.text).size().x;
         let sat = pos2(mr.min.x - 14.0 - sw, y);
         let (sr, g) = chip(ui, sat, set, true);
@@ -405,5 +474,54 @@ mod tests {
         assert!(zoomed(100.0, -100.0, 10.0, 360.0) > 100.0);
         assert_eq!(zoomed(350.0, -1e6, 10.0, 360.0), 360.0);
         assert_eq!(zoomed(f64::NAN, 0.0, 90.0, 360.0), 90.0);
+    }
+
+    /// Manual keyframing over keyframes: an aim holds still while playing (it isn't undone each
+    /// frame and snapped back to the keyframes), K sets it among them without stopping, and an
+    /// aim not set goes away when the playhead is moved while stopped.
+    #[test]
+    fn manual_aims_hold_over_keyframes_while_playing_and_k_sets_them() {
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+        s.execute("effects.apply", json!({"clips": [clip.0], "effect": "VR Reframe"})).unwrap();
+        let index = s.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().position(|e| e.effect == EFFECT).unwrap();
+        for (seconds, pan) in [(0.5, 0.0), (2.5, 90.0)] {
+            s.execute("playhead.set", json!({"seconds": seconds})).unwrap();
+            s.execute("effects.setParam", json!({"clip": clip.0, "effect": index, "param": "pan", "value": pan, "keyframe": true})).unwrap();
+        }
+        s.execute("playhead.set", json!({"seconds": 1.0})).unwrap();
+        let mut app = FilmcraftApp::new(s);
+        let ctx = egui::Context::default();
+        app.ui.vr_keyframing_manual = true;
+        let pan = |app: &FilmcraftApp| {
+            let it = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
+            let e = it.effects[index].clone();
+            (filmcraft_render::vfx::reframe_value(&e, "pan", it.effect_time_at(app.session.playhead())), e.param("pan").unwrap().keyframes.len())
+        };
+        // aim to 45° and play on: the aim holds
+        preview(&mut app, clip, index, &[("pan", 45.0)]);
+        app.play(1.0);
+        app.session.execute("playhead.set", json!({"seconds": 1.5})).unwrap();
+        drop_stale_preview(&mut app);
+        assert!(app.ui.vr_pending.is_some(), "the aim survives playback");
+        assert_eq!(pan(&app).0, 45.0);
+        // K while playing with an aim waiting: keyframed at 1.5 s among the others, still playing
+        assert!(k_keyframes(&app));
+        crate::menus::invoke_command(&mut app, &ctx, "playback.stop", json!({})).unwrap();
+        assert!(app.playback.playing);
+        assert!(app.ui.vr_pending.is_none());
+        assert_eq!(pan(&app), (45.0, 3), "the old keyframes are back, with the new one");
+        // without an aim waiting, K stops
+        assert!(!k_keyframes(&app));
+        app.stop();
+        // an aim made while stopped goes away when the playhead is moved
+        preview(&mut app, clip, index, &[("pan", -30.0)]);
+        assert_eq!(pan(&app).0, -30.0);
+        app.session.execute("playhead.set", json!({"seconds": 2.0})).unwrap();
+        drop_stale_preview(&mut app);
+        assert!(app.ui.vr_pending.is_none());
+        assert_eq!(pan(&app).1, 3, "the keyframes are back");
+        assert!(app.session.history.redo.is_empty(), "no stray redo");
     }
 }

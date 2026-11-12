@@ -145,7 +145,20 @@ impl FilmcraftApp {
 
     /// Run the commands of the bindings `match_shortcuts` fired, as the focused panel scopes them.
     fn fire_shortcuts(&mut self, ctx: &egui::Context, fire: Vec<String>) {
-        for id in fire {
+        for mut id in fire {
+            // Delete in Effect Controls is Clear, as Backspace is (it would otherwise reach the
+            // Project panel's Clear, which has nothing selected there)
+            if self.ui.focused == PanelKind::EffectControls && id == "project.delete" {
+                id = "edit.clear".to_string();
+            }
+            // Delete / Backspace with keyframes selected deletes those keyframes, before the
+            // panel's own Clear below removes the selected effect or mask
+            if matches!(id.as_str(), "edit.clear" | "edit.rippleDelete") && panels::effect_controls::delete_keyframes_params(self).is_some() {
+                if let Err(e) = menus::invoke(self, ctx, "edit.clear", json!({})) {
+                    self.ui.status = e;
+                }
+                continue;
+            }
             // Clear in the Project panel removes the selected bin when no item is selected (#587).
             let clear = if self.ui.focused == PanelKind::Project && id == "project.delete" {
                 self.ui.project_panel.rename = None;
@@ -502,5 +515,44 @@ mod exact_modifier_tests {
         assert_eq!(equals, ["timeline.increaseVideoHeight"]);
         assert_eq!(fired(PanelKind::Timeline, Key::Plus, cmd() | Modifiers::SHIFT), equals);
         assert_eq!(fired(PanelKind::Timeline, Key::Plus, cmd()), equals);
+    }
+}
+
+#[cfg(test)]
+mod keyframe_delete_key_tests {
+    use crate::dock::PanelKind;
+    use crate::state::KeyframeRef;
+    use egui::{Event, Key, Modifiers};
+    use serde_json::json;
+
+    /// Delete and Backspace in Effect Controls with keyframes selected delete those keyframes:
+    /// the panel's own Clear (which removes the selected effect, or nothing) ran first and left
+    /// them, and Delete reached the Project panel's Clear instead.
+    #[test]
+    fn delete_and_backspace_delete_selected_keyframes_in_effect_controls() {
+        for key in [Key::Delete, Key::Backspace] {
+            let mut s = filmcraft_engine::Session::default();
+            s.execute("file.openDemoProject", json!({})).unwrap();
+            let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+            s.execute("timeline.select", json!({"clips": [clip.0]})).unwrap();
+            let mut times = Vec::new();
+            for seconds in [0.5, 1.0] {
+                s.execute("playhead.set", json!({"seconds": seconds})).unwrap();
+                s.execute("effects.addKeyframe", json!({"clip": clip.0, "effect": "motion", "param": "scale"})).unwrap();
+                times.push(s.active_sequence().unwrap().find_item(clip).unwrap().1.source_time_at(s.playhead()));
+            }
+            let mut app = super::FilmcraftApp::new(s);
+            app.bindings = super::menus::bindings(&app);
+            let effect = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().position(|e| e.effect == "motion").unwrap();
+            app.ui.focused = PanelKind::EffectControls;
+            app.ui.keyframe_selection = vec![KeyframeRef { clip: clip.0, effect, param: "scale".into(), mask: None, time: times[0] }];
+            let mut input = egui::InputState::default();
+            input.events = vec![Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers: Modifiers::NONE }];
+            let fire = app.match_shortcuts(&mut input, false, false, false);
+            app.fire_shortcuts(&egui::Context::default(), fire);
+            let it = app.session.active_sequence().unwrap().find_item(clip).map(|(_, it)| it.clone()).expect("the clip stays");
+            let left: Vec<_> = it.effects[effect].params["scale"].keyframes.iter().map(|k| k.time).collect();
+            assert_eq!(left, [times[1]], "{key:?} deletes the selected keyframe");
+        }
     }
 }

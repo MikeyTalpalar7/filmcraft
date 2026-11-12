@@ -497,8 +497,9 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
             return Ok(json!({"speed": app.playback.speed}));
         }
         "playback.stop" => {
-            // K while stopped keyframes the VR Reframe under the playhead (K still stops playback)
-            if !targets_source(app, &params) && !app.playback.playing && crate::panels::vr_reframe_handles::has_target(app) {
+            // K keyframes the VR Reframe under the playhead while stopped, or a Manual aim steered
+            // while playing (which keeps playing); otherwise K stops playback
+            if !targets_source(app, &params) && crate::panels::vr_reframe_handles::k_keyframes(app) {
                 return crate::panels::vr_reframe_handles::set_keyframe(app, ctx);
             }
             if targets_source(app, &params) {
