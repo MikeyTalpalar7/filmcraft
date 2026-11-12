@@ -498,6 +498,8 @@ pub fn motion_matrix(seq: &Sequence, item: &TrackItem, src: (u32, u32), src_par:
         let fit = (sw * q / (src.0.max(1) as f64 * p)).min(sh / src.1.max(1) as f64);
         scale = scale * fit;
     }
+    // a VR Reframe view drawn smaller than the frame, to fit in the layer, fills it again
+    scale = scale * vfx::reframe_fill(item, (seq.settings.width, seq.settings.height), src);
     // source px → (× p) display units → Scale, Rotation → (÷ q) sequence px. Without rotation the
     // two stretches merge into one horizontal factor, exactly 1 when the ratios are the same.
     if rot == 0.0 {

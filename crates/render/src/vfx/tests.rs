@@ -1369,6 +1369,40 @@ mod pipeline {
         let e = render_sequence(&p2, seq2, r.tick_of(30), RenderOptions::default(), &map2);
         assert!(e.px.iter().all(|v| v.is_finite()));
     }
+
+    /// The share of a frame's pixels left uncovered (transparent).
+    fn uncovered(img: &Image) -> f64 {
+        let n = img.px.chunks(4).filter(|p| p[3] < 0.99).count();
+        n as f64 / (img.w * img.h) as f64
+    }
+
+    #[test]
+    fn vr_reframe_fills_a_frame_taller_than_the_footage_at_scale_100() {
+        // 2:1 "360°" footage, as 5760 x 2880 in a vertical 4K sequence: the view is taller than
+        // the footage, so it is drawn smaller and Motion enlarges the layer to fill the frame
+        let r = FrameRate::FPS_24;
+        let render = |seq_size: (u32, u32)| {
+            let mut p = Project::new("vr");
+            let mut map = SourceMap::default();
+            let red = GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, 200, 100, r, Tick(10 * TICKS_PER_SECOND));
+            let clip = add(&mut p, &mut map, red);
+            let settings = SequenceSettings { width: seq_size.0, height: seq_size.1, frame_rate: r, ..Default::default() };
+            let seq = p.new_sequence("s", settings, 1, 0, None);
+            let mut ti = p.make_track_item(clip, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(48)), r).unwrap();
+            ti.effects.push(inst("vr_reframe"));
+            let fill = crate::vfx::reframe_fill(&ti, seq_size, (200, 100));
+            p.sequence_mut(seq).unwrap().video_tracks[0].items.push(ti);
+            (render_sequence(&p, seq, r.tick_of(1), RenderOptions::default(), &map), fill)
+        };
+        let (tall, fill) = render((90, 160));
+        // 160 / 100, and a pixel more at the top and bottom
+        assert!((fill - 1.6 * (1.0 + 2.0 / 160.0)).abs() < 1e-9, "{fill}");
+        assert_eq!(uncovered(&tall), 0.0, "the whole vertical frame shows the view");
+        // a frame that fits in the footage keeps Motion's 1:1 placement
+        let (wide, fill) = render((160, 90));
+        assert_eq!(fill, 1.0);
+        assert_eq!(uncovered(&wide), 0.0);
+    }
 }
 
 #[test]

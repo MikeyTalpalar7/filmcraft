@@ -382,10 +382,40 @@ fn split_px(src: &Image, (a, b): (&Cam, &Cam), sp: &Split, shape: Shape, (fx, fy
     [0, 1, 2, 3].map(|k| ca[k] + (cb[k] - ca[k]) * f as f32)
 }
 
+/// How much smaller than the sequence frame VR Reframe draws its view inside a `src`-sized
+/// layer, so the whole view fits in the layer: 1 when the frame fits (an HD or 4K landscape
+/// sequence on 360° footage), less for a frame taller or wider than the footage (a vertical 4K
+/// sequence on 5760 x 2880 footage: 2880 / 3840 = 0.75).
+pub fn reframe_shrink(seq: (u32, u32), src: (u32, u32)) -> f64 {
+    let (sw, sh) = (f64::from(seq.0.max(1)), f64::from(seq.1.max(1)));
+    (f64::from(src.0) / sw).min(f64::from(src.1) / sh).clamp(1e-3, 1.0)
+}
+
+/// The enlargement Motion gives an item whose VR Reframe draws its view smaller than the frame
+/// ([`reframe_shrink`]), so the view fills the sequence frame at Scale 100 %. It overshoots by a
+/// sequence pixel on each side, so the layer's own edge (blended with what is beyond it when
+/// enlarged) stays outside the frame. 1 for every other item (no enabled VR Reframe, a frame that
+/// fits in the footage, or a stereoscopic layout, whose eyes are reframed in place).
+pub fn reframe_fill(item: &filmcraft_project::TrackItem, seq: (u32, u32), src: (u32, u32)) -> f64 {
+    let shrink = reframe_shrink(seq, src);
+    match item.effects.iter().find(|e| e.effect == "vr_reframe" && e.enabled) {
+        Some(e) if chv(e, "frame_layout") == 0 && shrink < 1.0 => {
+            // the frame side that meets the layer's edge
+            let (sw, sh) = (f64::from(seq.0.max(1)), f64::from(seq.1.max(1)));
+            let edge = if f64::from(src.1) / sh <= f64::from(src.0) / sw { sh } else { sw };
+            (1.0 + 2.0 / edge) / shrink
+        }
+        _ => 1.0,
+    }
+}
+
 /// VR Reframe: a flat view of the sphere (a normal shot, a wide view, a little planet or a rabbit
 /// hole) that fills the sequence frame (the whole layer without a sequence, and for each eye of
 /// a stereoscopic layout). The layer is centred in the sequence 1:1 by Motion's defaults, so the
 /// view covers the sequence frame's rectangle in layer pixels and is transparent outside it.
+/// When that rectangle is bigger than the layer, the view is drawn [`reframe_shrink`] times
+/// smaller and Motion enlarges the layer by as much ([`reframe_fill`]), so it still fills the
+/// frame at Scale 100 % with nothing cut off.
 ///
 /// The numbers move through their keyframes as [`super::reframe_motion`] says, and a change of
 /// View or Lens morphs over the time between its keyframes.
@@ -398,7 +428,7 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
     let target = match (layout, cx.env) {
         (0, Some(env)) => {
             let (sw, sh) = env.sequence_size();
-            let k = img.w as f64 / env.source_size().0.max(1) as f64;
+            let k = img.w as f64 / env.source_size().0.max(1) as f64 * reframe_shrink((sw, sh), env.source_size());
             Some((sw as f64 * k, sh as f64 * k))
         }
         _ => None,
@@ -422,10 +452,15 @@ fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
         let (w, h) = (v.w, v.h);
         let (tw, th) = target.filter(|(tw, th)| *tw >= 1.0 && *th >= 1.0).unwrap_or((w as f64, h as f64));
         let (x0, y0) = ((w as f64 - tw) * 0.5, (h as f64 - th) * 0.5);
+        // the view runs a pixel past its edge, so a view whose edge falls between pixels (drawn
+        // smaller, then enlarged by Motion) has no see-through rim
+        let (mx, my) = (1.0 / tw, 1.0 / th);
         v.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
             for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (fx, fy) = ((x as f64 + 0.5 - x0) / tw, (y as f64 + 0.5 - y0) / th);
-                *px = if !((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)) {
+                let inside = (-mx..=1.0 + mx).contains(&fx) && (-my..=1.0 + my).contains(&fy);
+                let (fx, fy) = (fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0));
+                *px = if !inside {
                     [0.0; 4]
                 } else if let Some((b, sp)) = &split {
                     split_px(&src, (&a, b), sp, shape, (fx, fy), th / tw)

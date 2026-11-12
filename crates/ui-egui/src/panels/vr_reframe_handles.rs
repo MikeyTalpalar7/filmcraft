@@ -279,10 +279,7 @@ fn hint_and_mode(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
         ui.painter().rect_filled(r, 3.0, Color32::from_black_alpha(170));
         (r, (*g).clone())
     };
-    let hint = crate::i18n::t("VR Reframe: drag to aim, ⌥ drag to roll, scroll to zoom");
     let y = pic.max.y - 6.0 - 13.0;
-    let (_, g) = chip(ui, pos2(pic.min.x + 8.0, y), hint, false);
-    ui.painter().galley(pos2(pic.min.x + 8.0, y), g.into(), t.text);
     let mode = if app.ui.vr_keyframing_manual { tl!("Keyframes: Manual") } else { tl!("Keyframes: Auto") };
     let mw = ui.painter().layout_no_wrap(mode.to_string(), Tokens::ui(10.0), t.text).size().x;
     let mat = pos2(pic.max.x - 13.0 - mw, y);
@@ -293,6 +290,7 @@ fn hint_and_mode(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
         app.ui.vr_keyframing_manual = !app.ui.vr_keyframing_manual;
     }
     app.auto.add("program.vrReframe.keyframing", mr, mode);
+    let mut left = mr.min.x;
     if app.ui.vr_pending.is_some() {
         let set = tl!("Set Keyframe ⌥⇧K");
         let sw = ui.painter().layout_no_wrap(set.to_string(), Tokens::ui(10.0), t.text).size().x;
@@ -303,7 +301,17 @@ fn hint_and_mode(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
             let _ = set_keyframe(app, ui.ctx());
         }
         app.auto.add("program.vrReframe.setKeyframe", sr, set);
+        left = sr.min.x;
     }
+    // the hint at the bottom left, a row higher when it would run into the buttons (a narrow,
+    // vertical frame)
+    // (wrapped to the picture's width)
+    let hint = crate::i18n::t("VR Reframe: drag to aim, ⌥ drag to roll, scroll to zoom");
+    let g = ui.painter().layout(hint.to_string(), Tokens::ui(10.0), t.text, (pic.width() - 26.0).max(40.0));
+    let fits = pic.min.x + 8.0 + g.size().x + 5.0 + 8.0 <= left;
+    let at = pos2(pic.min.x + 8.0, if fits { y } else { y - 10.0 - g.size().y });
+    ui.painter().rect_filled(Rect::from_min_size(at, g.size()).expand2(vec2(5.0, 2.0)), 3.0, Color32::from_black_alpha(170));
+    ui.painter().galley(at, g, t.text);
 }
 
 #[cfg(test)]
