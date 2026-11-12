@@ -55,6 +55,39 @@ const TIMEBASES: [(i64, i64); 15] = [
     (120_000, 1001),
     (120, 1),
 ];
+/// A new sequence's timebase: 30 frames per second.
+const NEW_SEQUENCE_RATE: FrameRate = FrameRate { num: 30, den: 1 };
+
+/// Frame Size presets: name and size. The landscape ones turn upright with the Vertical tick
+/// box; the upright ones (taller than wide) are made for phones and stay upright.
+struct FramePreset {
+    name: &'static str,
+    w: u32,
+    h: u32,
+}
+const FRAME_PRESETS: [FramePreset; 9] = [
+    FramePreset { name: "HD 1080p", w: 1920, h: 1080 },
+    FramePreset { name: "HD 720p", w: 1280, h: 720 },
+    FramePreset { name: "2K DCI", w: 2048, h: 1080 },
+    FramePreset { name: "2K QHD 1440p", w: 2560, h: 1440 },
+    FramePreset { name: "4K UHD", w: 3840, h: 2160 },
+    FramePreset { name: "4K DCI", w: 4096, h: 2160 },
+    FramePreset { name: "Square 1:1", w: 1080, h: 1080 },
+    FramePreset { name: "Instagram Portrait 4:5", w: 2160, h: 2700 },
+    FramePreset { name: "Vertical 9:16 (Reels, Shorts, TikTok)", w: 1080, h: 1920 },
+];
+
+/// The preset a frame size is (either way up), if any.
+fn frame_preset(w: u32, h: u32) -> Option<&'static FramePreset> {
+    FRAME_PRESETS.iter().find(|p| (p.w, p.h) == (w, h)).or_else(|| FRAME_PRESETS.iter().find(|p| (p.h, p.w) == (w, h)))
+}
+
+/// The size picking `p` gives, upright when `vertical` (a square stays square).
+fn preset_size(p: &FramePreset, vertical: bool) -> (u32, u32) {
+    let (long, short) = (p.w.max(p.h), p.w.min(p.h));
+    if vertical { (short, long) } else { (long, short) }
+}
+
 const SAMPLE_RATES: [u32; 5] = [32_000, 44_100, 48_000, 88_200, 96_000];
 const MIXES: [&str; 4] = ["Stereo", "Mono", "5.1", "Adaptive"];
 
@@ -92,6 +125,7 @@ pub fn open(app: &mut FilmcraftApp) {
         working_space: st.color.working.id().into(),
         wide_gamut: st.color.wide_gamut,
         auto_tone_map: st.color.auto_tone_map,
+        lock_ratio: None,
     };
     app.dialog = Some(crate::Dialog::SequenceSettings);
 }
@@ -99,7 +133,7 @@ pub fn open(app: &mut FilmcraftApp) {
 /// File ▸ New ▸ Sequence…: the dialog as New Sequence, from the default settings, named like
 /// `file.newSequence` would name it, with three video and three audio tracks.
 pub fn open_new(app: &mut FilmcraftApp, bin: Option<Option<u64>>) {
-    let st = SequenceSettings::default();
+    let st = SequenceSettings { frame_rate: NEW_SEQUENCE_RATE, ..SequenceSettings::default() };
     let n = app.session.project.sequences().count() + 1;
     app.ui.sequence_settings = SequenceSettingsDraft {
         tab: "general".into(),
@@ -121,6 +155,7 @@ pub fn open_new(app: &mut FilmcraftApp, bin: Option<Option<u64>>) {
         wide_gamut: st.color.wide_gamut,
         auto_tone_map: st.color.auto_tone_map,
         name: format!("Sequence {n:02}"),
+        lock_ratio: None,
     };
     app.dialog = Some(crate::Dialog::SequenceSettings);
 }
@@ -264,6 +299,58 @@ fn changes(d: &SequenceSettingsDraft, cur: &SequenceSettings, cur_name: &str) ->
 
 type Elems = Vec<(String, egui::Rect, String)>;
 
+/// The Preset list (common frame sizes) and the Vertical tick box (upright: the frame's width and
+/// height swapped), and Lock Ratio (editing one side of the Frame Size sets the other). Automation
+/// ids: `sequenceSettings.preset` (+ `preset.option.<n>` while open), `sequenceSettings.vertical`,
+/// `sequenceSettings.lockRatio`.
+fn frame_presets(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, elems: &mut Elems, label_w: f32, list_w: f32) {
+    row(ui, label_w, "Preset:", true, |ui| {
+        let vertical = d.height > d.width;
+        let shown = frame_preset(d.width, d.height).map_or_else(|| t("Custom").to_string(), |p| t(p.name).to_string());
+        let resp = craft_ui::ComboBox::from_id_salt("seq-settings-preset").selected_text(&shown).width(list_w - 90.0).height(f32::INFINITY).show_ui(ui, |ui| {
+            for (n, p) in FRAME_PRESETS.iter().enumerate() {
+                // the phone presets are upright whatever the tick box says
+                let (w, h) = if p.h > p.w { (p.w, p.h) } else { preset_size(p, vertical) };
+                let label = format!("{}  ({w} × {h})", t(p.name));
+                let o = ui.selectable_label((d.width, d.height) == (w, h), &label);
+                if o.clicked() {
+                    (d.width, d.height) = (w, h);
+                }
+                elems.push((format!("sequenceSettings.preset.option.{n}"), o.rect, label));
+            }
+        });
+        elems.push(("sequenceSettings.preset".into(), resp.response.rect, shown));
+        let mut upright = vertical;
+        let v = ui.checkbox(&mut upright, tl!("Vertical"));
+        if upright != vertical {
+            (d.width, d.height) = (d.height, d.width);
+        }
+        elems.push(("sequenceSettings.vertical".into(), v.rect, upright.to_string()));
+        let mut locked = d.lock_ratio.is_some();
+        let l = ui
+            .checkbox(&mut locked, tl!("Lock Ratio"))
+            .on_hover_text(tl!("Changing the width changes the height to keep the frame's shape, and the other way round"));
+        if locked != d.lock_ratio.is_some() {
+            d.lock_ratio = locked.then_some((d.width, d.height));
+        }
+        elems.push(("sequenceSettings.lockRatio".into(), l.rect, locked.to_string()));
+    });
+}
+
+/// The frame size after an edit from `before` to `after`, keeping the ratio `lock` (width,
+/// height) when locked: the side that changed sets the other (rounded, within 1…the largest frame
+/// side). Unlocked, or both sides changed (a preset), it is `after`.
+fn keep_ratio(before: (u32, u32), after: (u32, u32), lock: Option<(u32, u32)>) -> (u32, u32) {
+    let Some((rw, rh)) = lock.filter(|(w, h)| *w > 0 && *h > 0) else { return after };
+    let max = f64::from(filmcraft_project::MAX_FRAME_SIDE);
+    let side = |v: f64| v.round().clamp(1.0, max) as u32;
+    match (after.0 != before.0, after.1 != before.1) {
+        (true, false) => (after.0, side(f64::from(after.0) * f64::from(rh) / f64::from(rw))),
+        (false, true) => (side(f64::from(after.1) * f64::from(rw) / f64::from(rh)), after.1),
+        _ => after,
+    }
+}
+
 /// One labelled row: the label right-aligned in a `label_w` column, then the control.
 fn row<R>(ui: &mut egui::Ui, label_w: f32, label: &str, enabled: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal(|ui| {
@@ -342,17 +429,26 @@ fn general(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, cur: &SequenceSetti
     });
     section(ui, "Video", |ui| {
         row(ui, label_w, "Frame Size:", true, |ui| {
+            let before = (d.width, d.height);
             let w = ui.add(crate::widgets::number_drag(&mut d.width).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
             elems.push(("sequenceSettings.width".into(), w.rect, d.width.to_string()));
             ui.label(tl!("horizontal"));
             let h = ui.add(crate::widgets::number_drag(&mut d.height).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
             elems.push(("sequenceSettings.height".into(), h.rect, d.height.to_string()));
             ui.label(tl!("vertical"));
+            (d.width, d.height) = keep_ratio(before, (d.width, d.height), d.lock_ratio);
             // the display aspect: 1440 x 1080 with 4:3 pixels is 16:9
             let a = aspect(display_width(d.width, d.height, cur.par), d.height);
             let ar = ui.label(&a);
             elems.push(("sequenceSettings.aspect".into(), ar.rect, a));
         });
+        let typed = (d.width, d.height);
+        frame_presets(ui, d, elems, label_w, list_w);
+        // a preset or the Vertical tick box sets a new ratio to keep (not the rounding of a typed
+        // side, which would drift)
+        if d.lock_ratio.is_some() && (d.width, d.height) != typed {
+            d.lock_ratio = Some((d.width, d.height));
+        }
         let r = ui.checkbox(&mut d.scale_motion, tl!("Scale motion effects proportionally when changing frame size"));
         elems.push(("sequenceSettings.scaleMotion".into(), r.rect, d.scale_motion.to_string()));
         row(ui, label_w, "Pixel Aspect Ratio:", false, |ui| fixed_combo(ui, elems, "par", &par_label(cur.par), list_w, NOT_YET));
@@ -587,6 +683,41 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_ratio_keeps_the_frame_shape() {
+        let lock = Some((1080, 1920));
+        // the width sets the height, and the other way round
+        assert_eq!(keep_ratio((1080, 1920), (720, 1920), lock), (720, 1280));
+        assert_eq!(keep_ratio((1080, 1920), (1080, 3840), lock), (2160, 3840));
+        // unlocked, or both sides at once (a preset): as given
+        assert_eq!(keep_ratio((1080, 1920), (720, 1920), None), (720, 1920));
+        assert_eq!(keep_ratio((1080, 1920), (3840, 2160), lock), (3840, 2160));
+        // hostile ratios and sizes stay in range
+        assert_eq!(keep_ratio((10, 10), (5, 10), Some((0, 7))), (5, 10));
+        assert_eq!(keep_ratio((1, 1), (1, 2), Some((u32::MAX, 1))).0, filmcraft_project::MAX_FRAME_SIDE);
+        assert_eq!(keep_ratio((100, 100), (1, 100), Some((u32::MAX, 1))).1, 1);
+        // the Instagram preset is 4:5 at twice the usual size
+        let ig = FRAME_PRESETS.iter().find(|p| p.name.starts_with("Instagram")).unwrap();
+        assert_eq!((ig.w, ig.h), (2160, 2700));
+    }
+
+    #[test]
+    fn frame_presets_turn_upright() {
+        let hd = frame_preset(1920, 1080).unwrap();
+        assert_eq!(preset_size(hd, false), (1920, 1080));
+        assert_eq!(preset_size(hd, true), (1080, 1920));
+        // an upright size is still its preset
+        assert_eq!(frame_preset(2160, 3840).unwrap().name, "4K UHD");
+        assert_eq!(preset_size(frame_preset(1080, 1080).unwrap(), true), (1080, 1080));
+        assert!(frame_preset(1000, 1000).is_none());
+        // every preset is a size a sequence can have
+        for p in &FRAME_PRESETS {
+            assert!(p.w >= 1 && p.h >= 1 && p.w.max(p.h) <= filmcraft_project::MAX_FRAME_SIDE);
+        }
+        assert_eq!(NEW_SEQUENCE_RATE, FrameRate { num: 30, den: 1 });
+        assert!(TIMEBASES.contains(&(30, 1)));
+    }
 
     #[test]
     fn aspect_labels() {

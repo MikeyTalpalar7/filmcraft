@@ -67,7 +67,8 @@ fn effects_list_reports_folders_and_badges() {
     assert_eq!(find("lens_flare")["folder"], "Lights & Glows");
     let n =
         arr.iter().filter(|e| e["kind"] == "Video" && e["category"][0] == "Video Effects" && e["folder"] != "Obsolete" && e["folder"] != Value::Null).count();
-    assert_eq!(n, 93, "Premiere 26's current Video Effects");
+    assert_eq!(n, 93 + filmcraft_project::effect::BEYOND_PREMIERE.len(), "Premiere 26's current Video Effects, and FilmCraft's own");
+    assert_eq!(find("vr_reframe")["folder"], "Immersive Video");
 }
 
 #[test]
@@ -241,4 +242,41 @@ fn transition_duration_is_clamped_to_what_the_cut_supports() {
     let err =
         preview_transition(&s, &json!({"effect": "cross_dissolve", "clip": clips[1].0, "edge": "in", "frames": 5}), TrackKind::Video).unwrap_err().to_string();
     assert!(err.contains("no room for a transition"), "{err}");
+}
+
+#[test]
+fn toggle_animation_all_animates_every_parameter_in_one_undo_step() {
+    let mut s = demo();
+    let clip = first_v1_clip(&s);
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "vr_reframe"})).unwrap();
+    let fx = |s: &Session| s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(clip)).unwrap().1.effect("vr_reframe").unwrap().clone();
+    let animatable: Vec<&str> = fx(&s).def().unwrap().params.iter().filter(|d| d.animatable).map(|d| d.id).collect();
+    assert!(animatable.contains(&"pan") && animatable.contains(&"lens") && animatable.contains(&"split_order"));
+    // one already animated: the others join it
+    s.execute("effects.toggleAnimation", json!({"clip": clip, "effect": "vr_reframe", "param": "pan"})).unwrap();
+    let r = s.execute("effects.toggleAnimationAll", json!({"clip": clip, "effect": "vr_reframe"})).unwrap();
+    assert_eq!(r["animated"], json!(true));
+    assert_eq!(r["changed"].as_u64(), Some(animatable.len() as u64 - 1));
+    let e = fx(&s);
+    assert!(animatable.iter().all(|id| e.param(id).is_some_and(|p| p.is_animated())), "{animatable:?}");
+    // all animated: they all stop, keeping their values
+    s.execute("effects.setParam", json!({"clip": clip, "effect": "vr_reframe", "param": "fov", "value": 140.0})).unwrap();
+    let r = s.execute("effects.toggleAnimationAll", json!({"clip": clip, "effect": "vr_reframe"})).unwrap();
+    assert_eq!(r["animated"], json!(false));
+    let e = fx(&s);
+    assert!(animatable.iter().all(|id| !e.param(id).is_some_and(|p| p.is_animated())));
+    assert_eq!(e.param("fov").unwrap().value.as_f64(), Some(140.0));
+    // one undo step brings every keyframe track back
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(fx(&s).param("lens").unwrap().is_animated());
+    // hostile parameters
+    for p in [
+        json!({}),
+        json!({"clip": clip, "effect": 999}),
+        json!({"clip": clip, "effect": -1}),
+        json!({"clip": clip, "effect": "nope"}),
+        json!({"clip": 1e12, "effect": 0}),
+    ] {
+        assert!(s.execute("effects.toggleAnimationAll", p).is_err());
+    }
 }

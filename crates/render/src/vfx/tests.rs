@@ -89,6 +89,7 @@ const NEW_IDS: &[&str] = &[
     "vr_glow",
     "vr_plane_to_sphere",
     "vr_projection",
+    "vr_reframe",
     "vr_rotate_sphere",
     "vr_sharpen",
     "alpha_adjust",
@@ -1592,4 +1593,289 @@ fn lengths_past_the_picture_keep_their_fade_and_weighting() {
     assert!(shadow_320 < shadow_far, "the fade still follows the requested length: {shadow_320} vs {shadow_far}");
     let (glint_32, glint_320) = (total(&render("glint", 32.0)), total(&render("glint", 320.0)));
     assert!((glint_32 - glint_320).abs() > 0.01 * glint_32.abs(), "glint weighting follows the requested length: {glint_32} vs {glint_320}");
+}
+
+#[test]
+fn view_dir_is_rectilinear_then_stereographic_and_continuous() {
+    use crate::vfx::view_dir;
+    let angle = |x: f64, fov: f64| view_dir(x, 0.0, fov).map(|d| d[2].clamp(-1.0, 1.0).acos().to_degrees());
+    assert_eq!(view_dir(0.0, 0.0, 120.0), Some([0.0, 0.0, 1.0]));
+    // the view's edge is half the field of view away from its centre, at every zoom
+    for fov in [30.0, 90.0, 120.0, 180.0, 270.0, 359.0] {
+        let a = angle(1.0, fov).unwrap();
+        assert!((a - fov / 2.0).abs() < 1e-6, "{fov}: {a}");
+    }
+    // a pinhole view while narrow: at 50°, half-way to the edge is atan(tan 25° / 2)
+    let pin = (25.0f64.to_radians().tan() * 0.5).atan().to_degrees();
+    assert!((angle(0.5, 50.0).unwrap() - pin).abs() < 1e-9);
+    // stereographic past 180°: half-way is 2·atan(tan(θ/2)/2)
+    let half = 2.0 * ((135.0f64 / 2.0).to_radians().tan() / 2.0).atan();
+    assert!((angle(0.5, 270.0).unwrap() - half.to_degrees()).abs() < 1e-9);
+    // zooming out never jumps
+    let mut last = angle(0.7, 60.0).unwrap();
+    for f in 61..=359 {
+        let a = angle(0.7, f as f64).unwrap();
+        assert!(a >= last - 1e-9 && a - last < 2.0, "{f}: {last} → {a}");
+        last = a;
+    }
+    // hostile input
+    for (x, fov) in [(f64::NAN, 90.0), (1.0, f64::NAN), (1e300, 359.0), (1.0, -5.0), (1.0, 1e9)] {
+        if let Some(d) = view_dir(x, 0.0, fov) {
+            assert!(d.iter().all(|v| v.is_finite()), "{x} {fov}");
+        }
+    }
+}
+
+#[test]
+fn vr_reframe_makes_little_planets_and_rabbit_holes() {
+    // sky (blue) above the horizon, ground (green) below
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let is = |p: [f32; 4], c: usize| p[c] > 0.9 && p[3] > 0.99;
+    let (blue, green) = (2, 1);
+    let mut e = inst("vr_reframe");
+    // Little Planet: the ground in the middle, the sky all round it
+    set(&mut e, "view", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), green));
+    assert!(is(o.get(1, 1), blue) && is(o.get(126, 62), blue));
+    // Rabbit Hole: the other way round
+    set(&mut e, "view", ParamValue::Choice(2));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), blue));
+    assert!(is(o.get(1, 1), green) && is(o.get(126, 62), green));
+    // Custom, level: sky above the middle, ground below; tilting up shows only sky
+    set(&mut e, "view", ParamValue::Choice(0));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 20), blue) && is(o.get(64, 44), green));
+    setf(&mut e, "tilt", 80.0);
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 32), blue) && is(o.get(64, 60), blue));
+    // hostile values stay finite
+    for f in [f64::NAN, -1e9, 1e9] {
+        setf(&mut e, "fov", f);
+        setf(&mut e, "pan", f);
+        let o = run("vr_reframe", &e, &img, &cx());
+        assert!(o.px.iter().all(|v| v.is_finite()));
+    }
+}
+
+#[test]
+fn lenses_and_shaping_map_as_specified() {
+    use crate::vfx::{Lens, Shape, lens_dir};
+    let none = Shape::default();
+    let angle = |x: f64, y: f64, fov: f64, lens: Lens, sh: Shape| lens_dir(x, y, fov, lens, sh).map(|d| d[2].clamp(-1.0, 1.0).acos().to_degrees());
+    let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-6);
+    // every lens puts the view's left and right edges half the field of view out
+    for lens in [Lens::Curve(0.0), Lens::Curve(0.5), Lens::Curve(1.0), Lens::Fisheye, Lens::MirrorBall] {
+        assert!(close(angle(1.0, 0.0, 120.0, lens, none), 60.0), "{lens:?}");
+    }
+    // fisheye: the angle grows evenly with the distance from the centre
+    assert!(close(angle(0.5, 0.0, 200.0, Lens::Fisheye, none), 50.0));
+    // mirror ball at 360°: the edge is the antipode, half-way is 2·asin(½) = 60°
+    assert!(close(angle(1.0, 0.0, 360.0, Lens::MirrorBall, none), 180.0));
+    assert!(close(angle(0.5, 0.0, 360.0, Lens::MirrorBall, none), 60.0));
+    // ... and nothing past its disc
+    assert!(lens_dir(1.0, 0.6, 360.0, Lens::MirrorBall, none).is_none());
+    // a straight lens can't reach 180°: it stops a degree short
+    assert!(close(angle(1.0, 0.0, 359.0, Lens::Curve(0.0), none), 89.5));
+    // panorama strip: verticals stay vertical (same longitude up a column), x is longitude
+    let lon = |d: [f64; 3]| d[0].atan2(d[2]).to_degrees();
+    let (a, b) = (lens_dir(0.5, 0.0, 300.0, Lens::Panorama, none).unwrap(), lens_dir(0.5, 0.4, 300.0, Lens::Panorama, none).unwrap());
+    assert!((lon(a) - 75.0).abs() < 1e-6 && (lon(b) - 75.0).abs() < 1e-6);
+    // twist turns a point at the edge by the full amount
+    let tw = lens_dir(1.0, 0.0, 120.0, Lens::Fisheye, Shape { twist: 90.0, ..none }).unwrap();
+    let up = lens_dir(0.0, 1.0, 120.0, Lens::Fisheye, none).unwrap();
+    assert!(tw.iter().zip(up).all(|(a, b)| (a - b).abs() < 1e-9));
+    // stretch makes the view wider: the same point reaches less far out horizontally
+    assert!(angle(1.0, 0.0, 120.0, Lens::Fisheye, Shape { stretch: 100.0, ..none }).unwrap() < 60.0);
+    // planet size: a positive value gives the middle more of the view
+    let (big, small) = (Shape { center: 60.0, ..none }, Shape { center: -60.0, ..none });
+    let mid = angle(0.5, 0.0, 300.0, Lens::Curve(1.0), none).unwrap();
+    assert!(angle(0.5, 0.0, 300.0, Lens::Curve(1.0), big).unwrap() < mid);
+    assert!(angle(0.5, 0.0, 300.0, Lens::Curve(1.0), small).unwrap() > mid);
+    // hostile shaping stays finite
+    for v in [f64::NAN, f64::INFINITY, -1e300] {
+        let sh = Shape { twist: v, stretch: v, center: v };
+        for lens in [Lens::Auto, Lens::Curve(v), Lens::Fisheye, Lens::MirrorBall, Lens::Panorama] {
+            if let Some(d) = lens_dir(0.3, 0.2, v, lens, sh) {
+                assert!(d.iter().all(|c| c.is_finite()), "{lens:?} {v}");
+            }
+        }
+    }
+}
+
+/// How much wider than tall a small round shape at `x` (on the horizon) comes out of an Automatic
+/// view `fov` wide: the radial over the sideways magnification there.
+fn edge_stretch(x: f64, fov: f64) -> f64 {
+    use crate::vfx::view_dir;
+    let ang = |x: f64, y: f64| view_dir(x, y, fov).map(|d| d[2].clamp(-1.0, 1.0).acos()).unwrap_or(0.0);
+    let h = 1e-5;
+    let radial = (ang(x + h, 0.0) - ang(x - h, 0.0)) / (2.0 * h);
+    // sideways: the angle subtended across a step up at that point, over the step
+    let (a, b) = (view_dir(x, h, fov).unwrap_or([0.0; 3]), view_dir(x, -h, fov).unwrap_or([0.0; 3]));
+    let side = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0).acos() / (2.0 * h);
+    side / radial
+}
+
+#[test]
+fn automatic_views_keep_people_in_proportion_when_zoomed_out() {
+    // a straight lens at 120° makes shapes at its edge twice as wide; Automatic holds them to 15%
+    for fov in [60.0, 90.0, 110.0, 120.0, 150.0, 179.0] {
+        let s = edge_stretch(1.0, fov);
+        assert!(s > 0.999 && s < 1.151, "{fov}°: {s}");
+    }
+    // past 180° it is stereographic: round things stay round everywhere
+    assert!((edge_stretch(0.9, 270.0) - 1.0).abs() < 1e-3);
+}
+
+fn keyed(e: &mut EffectInstance, id: &str, keys: &[(i64, ParamValue)]) {
+    let mut p = Param::new(keys[0].1.clone());
+    p.keyframes = keys.iter().map(|(t, v)| Keyframe::new(Tick(*t), v.clone())).collect();
+    e.params.insert(id.into(), p);
+}
+
+#[test]
+fn smooth_motion_eases_through_keyframes_without_stopping_or_overshooting() {
+    use crate::vfx::reframe_value;
+    let mut e = inst("vr_reframe");
+    let f = ParamValue::Float;
+    keyed(&mut e, "tilt", &[(0, f(0.0)), (100, f(10.0)), (200, f(30.0)), (300, f(30.0))]);
+    let at = |e: &EffectInstance, t| reframe_value(e, "tilt", Tick(t));
+    // it passes through every keyframe
+    for (t, v) in [(0, 0.0), (100, 10.0), (200, 30.0), (300, 30.0)] {
+        assert!((at(&e, t) - v).abs() < 1e-9, "{t}");
+    }
+    // eases out of the first keyframe (slower than linear at the start)…
+    assert!(at(&e, 10) < 1.0);
+    // …keeps moving through the middle one (no stop: speed either side of it)
+    let speed = |t: i64| at(&e, t + 1) - at(&e, t - 1);
+    assert!(speed(100) > 0.05, "{}", speed(100));
+    // …never goes past a keyframe's value, and holds still on the flat stretch
+    for t in 0..=300 {
+        assert!((-1e-9..=30.0 + 1e-9).contains(&at(&e, t)), "{t}: {}", at(&e, t));
+    }
+    assert!((at(&e, 250) - 30.0).abs() < 1e-9);
+    // a Hold keyframe holds
+    e.params.get_mut("tilt").unwrap().keyframes[1].interp = Interpolation::Hold;
+    assert!((at(&e, 150) - 10.0).abs() < 1e-9);
+    // Smooth Motion off: the keyframes' own (linear) interpolation
+    set(&mut e, "smooth", ParamValue::Bool(false));
+    e.params.get_mut("tilt").unwrap().keyframes[1].interp = Interpolation::Linear;
+    assert!((at(&e, 50) - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn pan_takes_the_short_way_round() {
+    use crate::vfx::reframe_value;
+    for smooth in [true, false] {
+        let mut e = inst("vr_reframe");
+        set(&mut e, "smooth", ParamValue::Bool(smooth));
+        keyed(&mut e, "pan", &[(0, ParamValue::Float(170.0)), (100, ParamValue::Float(-170.0))]);
+        for t in 0..=100 {
+            let v = reframe_value(&e, "pan", Tick(t));
+            assert!((170.0 - 1e-9..=190.0 + 1e-9).contains(&v), "{smooth} {t}: {v}");
+        }
+        assert!((reframe_value(&e, "pan", Tick(50)) - 180.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn view_and_lens_changes_morph_between_keyframes() {
+    use crate::vfx::reframe_choice;
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let mut e = inst("vr_reframe");
+    let c = ParamValue::Choice;
+    keyed(&mut e, "view", &[(0, c(0)), (1000, c(1))]);
+    // half-way the morph is half done (eased), and cuts across a Hold
+    assert_eq!(reframe_choice(&e, "view", Tick(500), 0), (0, 1, 0.5));
+    assert_eq!(reframe_choice(&e, "view", Tick(1000), 0), (1, 1, 0.0));
+    // the picture goes from a level view (sky above the middle) to a planet (ground in the middle)
+    let frame = |e: &EffectInstance, t: i64| run("vr_reframe", e, &img, &FxCtx { t: Tick(t), ..cx() });
+    let o = frame(&e, 0);
+    assert!(o.get(64, 20)[2] > 0.9);
+    let o = frame(&e, 1000);
+    assert!(o.get(64, 32)[1] > 0.9);
+    // mid-way the view is looking down part of the way: more ground than at the start
+    let ground = |o: &Image| (0..64).filter(|&y| o.get(64, y)[1] > 0.5).count();
+    let (g0, g5) = (ground(&frame(&e, 0)), ground(&frame(&e, 500)));
+    assert!(g0 < g5, "{g0} {g5}");
+    e.params.get_mut("view").unwrap().keyframes[0].interp = Interpolation::Hold;
+    assert_eq!(reframe_choice(&e, "view", Tick(500), 0), (0, 0, 0.0));
+    // a lens change morphs too, and every frame of it is finite and opaque in the middle
+    let mut e = inst("vr_reframe");
+    keyed(&mut e, "lens", &[(0, c(1)), (1000, c(4))]);
+    setf(&mut e, "fov", 300.0);
+    for t in [0, 250, 500, 750, 1000] {
+        let o = frame(&e, t);
+        assert!(o.px.iter().all(|v| v.is_finite()) && o.get(64, 32)[3] > 0.99, "{t}");
+    }
+    // hostile keyframes: out-of-range choices, NaN values, unsorted and repeated times
+    let mut e = inst("vr_reframe");
+    keyed(&mut e, "lens", &[(5, c(99)), (5, c(2)), (0, c(u32::MAX))]);
+    keyed(&mut e, "pan", &[(0, ParamValue::Float(f64::NAN)), (0, ParamValue::Float(1e300)), (-9, ParamValue::Float(-1e300))]);
+    for t in [-10, 0, 3, 5, 9] {
+        let o = frame(&e, t);
+        assert!(o.px.iter().all(|v| v.is_finite()), "{t}");
+        assert!(crate::vfx::reframe_value(&e, "pan", Tick(t)).is_finite());
+    }
+}
+
+#[test]
+fn split_screen_shows_two_views_and_swaps_them() {
+    let mut img = Image::new(128, 64);
+    for y in 0..64 {
+        for x in 0..128 {
+            let c = if y < 32 { [0.0, 0.0, 1.0, 1.0] } else { [0.0, 1.0, 0.0, 1.0] };
+            img.px[(y * 128 + x) * 4..(y * 128 + x) * 4 + 4].copy_from_slice(&c);
+        }
+    }
+    let (blue, green) = (2, 1);
+    let is = |p: [f32; 4], c: usize| p[c] > 0.9 && p[3] > 0.99;
+    let mut e = inst("vr_reframe");
+    // A looks up at the sky, B down at the ground
+    setf(&mut e, "tilt", 80.0);
+    setf(&mut e, "tilt2", -80.0);
+    set(&mut e, "split_feather", ParamValue::Float(0.0));
+    set(&mut e, "split", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 8), blue) && is(o.get(64, 56), green));
+    // the order swaps them
+    set(&mut e, "split_order", ParamValue::Choice(1));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(64, 8), green) && is(o.get(64, 56), blue));
+    // keyframed, half-way the swap is a cross-fade
+    keyed(&mut e, "split_order", &[(0, ParamValue::Choice(0)), (1000, ParamValue::Choice(1))]);
+    let o = run("vr_reframe", &e, &img, &FxCtx { t: Tick(500), ..cx() });
+    let p = o.get(64, 8);
+    assert!((p[1] - 0.5).abs() < 0.05 && (p[2] - 0.5).abs() < 0.05, "{p:?}");
+    // side by side, divider at 25%: the left quarter is A
+    let mut e = inst("vr_reframe");
+    setf(&mut e, "tilt", 80.0);
+    setf(&mut e, "tilt2", -80.0);
+    set(&mut e, "split_feather", ParamValue::Float(0.0));
+    set(&mut e, "split", ParamValue::Choice(2));
+    set(&mut e, "split_position", ParamValue::Float(25.0));
+    let o = run("vr_reframe", &e, &img, &cx());
+    assert!(is(o.get(10, 32), blue) && is(o.get(60, 32), green) && is(o.get(120, 32), green));
+    // a soft divider blends across it; hostile numbers stay finite
+    set(&mut e, "split_feather", ParamValue::Float(25.0));
+    for v in [f64::NAN, -1e9, 1e9] {
+        setf(&mut e, "split_position", v);
+        setf(&mut e, "fov2", v);
+        setf(&mut e, "pan2", v);
+        let o = run("vr_reframe", &e, &img, &cx());
+        assert!(o.px.iter().all(|c| c.is_finite()));
+    }
 }

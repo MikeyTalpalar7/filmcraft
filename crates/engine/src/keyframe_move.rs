@@ -131,6 +131,33 @@ pub(crate) fn interpolate_many(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+/// `effects.deleteKeyframes`: removes every listed keyframe in one undo step (what Delete does to
+/// the keyframes selected in Effect Controls). A parameter left with none keeps the last one's
+/// value. Every reference must exist, or nothing changes.
+pub(crate) fn delete_many(s: &mut Session, p: &Value) -> Result<Value> {
+    const DELETE: &str = "effects.deleteKeyframes";
+    let raw = p.get("keyframes").and_then(Value::as_array).ok_or_else(|| bad(DELETE, "need keyframes"))?;
+    if raw.is_empty() || raw.len() > MAX_KEYS {
+        return Err(bad(DELETE, "keyframe count must be between 1 and 4096"));
+    }
+    let keys: Vec<Key> = serde_json::from_value(Value::Array(raw.clone())).map_err(|_| bad(DELETE, "invalid keyframe reference"))?;
+    // each keyframe once (a repeated reference would fail as missing the second time)
+    let mut seen = HashSet::new();
+    let keys: Vec<Key> = keys.into_iter().filter(|k| seen.insert(k.clone())).collect();
+    let mut removed = 0usize;
+    s.edit_sequence("Delete Keyframes", |sequence, _, _| {
+        for key in &keys {
+            let lane = (key.clip, key.effect, key.mask, key.param.clone());
+            if !param_mut(sequence, &lane, DELETE)?.remove_keyframe_at(key.time) {
+                return Err(bad(DELETE, "keyframe does not exist"));
+            }
+            removed += 1;
+        }
+        Ok(())
+    })?;
+    Ok(json!({"removed": removed}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +182,39 @@ mod tests {
     fn values(s: &Session, key: &Value) -> Vec<Keyframe> {
         let it = s.active_sequence().unwrap().find_item(ClipId(key["clip"].as_u64().unwrap())).unwrap().1;
         it.effects[key["effect"].as_u64().unwrap() as usize].params[key["param"].as_str().unwrap()].keyframes.clone()
+    }
+
+    #[test]
+    fn deleting_keyframes_across_lanes_is_atomic_and_one_undo_step() {
+        let (mut s, keys) = fixture();
+        let undo = s.history.undo.len();
+        let before = (values(&s, &keys[0]), values(&s, &keys[2]));
+        // Scale's first keyframe and Rotation's only one (listed twice), in one step
+        let r = s.execute("effects.deleteKeyframes", json!({"keyframes": [keys[0], keys[2], keys[2]]})).unwrap();
+        assert_eq!(r["removed"], json!(2));
+        assert_eq!(s.history.undo.len(), undo + 1);
+        assert_eq!(values(&s, &keys[0]).len(), before.0.len() - 1);
+        assert!(values(&s, &keys[2]).is_empty());
+        // the last keyframe's value stays as the static value
+        let it = s.active_sequence().unwrap().find_item(ClipId(keys[2]["clip"].as_u64().unwrap())).unwrap().1;
+        let rotation = &it.effects[keys[2]["effect"].as_u64().unwrap() as usize].params["rotation"];
+        assert_eq!(rotation.value, before.1[0].value);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!((values(&s, &keys[0]), values(&s, &keys[2])), before);
+        // a missing keyframe changes nothing; hostile references are refused
+        let project = s.project.clone();
+        let mut gone = keys[1].clone();
+        gone["time"] = json!(-1);
+        assert!(s.execute("effects.deleteKeyframes", json!({"keyframes": [keys[0], gone]})).is_err());
+        assert!(Arc::ptr_eq(&project, &s.project));
+        for bad in [
+            json!({}),
+            json!({"keyframes": []}),
+            json!({"keyframes": [{"clip": 1}]}),
+            json!({"keyframes": [{"clip": 1e30, "effect": -1, "param": 3, "time": "x"}]}),
+        ] {
+            assert!(s.execute("effects.deleteKeyframes", bad).is_err());
+        }
     }
 
     #[test]

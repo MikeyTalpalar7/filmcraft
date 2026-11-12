@@ -24,6 +24,23 @@ pub(super) const LEGACY: &[&str] = &["Legacy", "Video Effects"];
 pub const TRACK_CHOICES: &[&str] = &["None", "Video 1", "Video 2", "Video 3", "Video 4", "Video 5", "Video 6", "Video 7", "Video 8"];
 /// Equirectangular frame layouts for the Immersive Video effects.
 pub const FRAME_LAYOUTS: &[&str] = &["Monoscopic", "Stereoscopic - Over/Under", "Stereoscopic - Side by Side"];
+/// FilmCraft's own video effects, beyond Premiere 26's catalogue (ids). They sit in the Premiere
+/// folders they belong with; the catalogue checks leave them out.
+pub const BEYOND_PREMIERE: &[&str] = &["vr_reframe"];
+
+/// VR Reframe's View: a free view (Field of View, Pan, Tilt, Roll), or one looking straight down
+/// (little planet) or up (rabbit hole) whose size is the Planet Field of View.
+pub const VR_VIEWS: &[&str] = &["Custom", "Little Planet (Outside In)", "Rabbit Hole (Inside Out)"];
+/// VR Reframe's Lens: Automatic (straight, curving as the view widens), Straight (rectilinear),
+/// Curved (stereographic), Fisheye (equidistant), Mirror Ball (equisolid), Panorama Strip
+/// (cylindrical) and Custom Curve (straight 0% … curved 100%, the Curve parameter).
+pub const VR_LENSES: &[&str] = &["Automatic", "Straight", "Curved", "Fisheye", "Mirror Ball", "Panorama Strip", "Custom Curve"];
+/// VR Reframe's Split: one view, or a second view (B) under or beside the first (A).
+pub const VR_SPLITS: &[&str] = &["Off", "Top and Bottom", "Side by Side"];
+/// VR Reframe's split Order: which view is on top (or on the left). Keyframed, the views swap
+/// with a cross-fade over the time between the keyframes (a Hold keyframe cuts).
+pub const VR_SPLIT_ORDERS: &[&str] = &["A Top / Left, B Bottom / Right", "B Top / Left, A Bottom / Right"];
+const SPLIT_GROUP: &str = "Split Screen";
 /// Easing for the animated Transform presets (Grow, Shrink, Move, Spin).
 pub const EASINGS: &[&str] = &["Linear", "Ease In", "Ease Out", "Ease In and Out"];
 pub const ECHO_OPERATORS: &[&str] = &["Add", "Maximum", "Minimum", "Screen", "Composite In Back", "Composite In Front", "Blend"];
@@ -204,6 +221,37 @@ fn immersive() -> Vec<EffectDef> {
                 ang("pan", "Pan (Y Axis)", 0.0),
                 ang("roll", "Roll (Z Axis)", 0.0),
                 b("stretch", "Stretch to Fit Frame", true),
+            ],
+        ),
+        vr(
+            "vr_reframe",
+            "VR Reframe",
+            vec![
+                // View and Lens animate: a change morphs over the time between keyframes
+                ParamDef { animatable: true, ..ch("view", "View", VR_VIEWS, 0) },
+                ParamDef { animatable: true, ..ch("lens", "Lens", VR_LENSES, 0) },
+                pct("curve", "Curve", 50.0),
+                fs("fov", "Field of View", 100.0, (10.0, 360.0), (10.0, 360.0), "°", 1),
+                fs("planet_fov", "Planet Field of View", 270.0, (90.0, 360.0), (90.0, 360.0), "°", 1),
+                ang("pan", "Pan", 0.0),
+                ang("tilt", "Tilt", 0.0),
+                ang("roll", "Roll", 0.0),
+                ang("twist", "Twist", 0.0),
+                fs("stretch", "Stretch", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
+                fs("planet_size", "Planet Size", 0.0, (-100.0, 100.0), (-100.0, 100.0), "", 1),
+                // a smooth camera move through the keyframes (no stop at each one)
+                b("smooth", "Smooth Motion", true),
+                // Split Screen: a second view (B) beside the first, each with its own lens and aim
+                grp(ch("split", "Split", VR_SPLITS, 0), SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("split_order", "Order", VR_SPLIT_ORDERS, 0) }, SPLIT_GROUP),
+                grp(fs("split_position", "Divider Position", 50.0, (5.0, 95.0), (5.0, 95.0), "%", 1), SPLIT_GROUP),
+                grp(fs("split_feather", "Divider Softness", 2.0, (0.0, 25.0), (0.0, 25.0), "%", 1), SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("view2", "View B", VR_VIEWS, 0) }, SPLIT_GROUP),
+                grp(ParamDef { animatable: true, ..ch("lens2", "Lens B", VR_LENSES, 0) }, SPLIT_GROUP),
+                grp(fs("fov2", "Field of View B", 100.0, (10.0, 360.0), (10.0, 360.0), "°", 1), SPLIT_GROUP),
+                grp(ang("pan2", "Pan B", 180.0), SPLIT_GROUP),
+                grp(ang("tilt2", "Tilt B", 0.0), SPLIT_GROUP),
+                grp(ang("roll2", "Roll B", 0.0), SPLIT_GROUP),
             ],
         ),
         vr("vr_rotate_sphere", "VR Rotate Sphere", vec![ang("tilt", "Tilt (X Axis)", 0.0), ang("pan", "Pan (Y Axis)", 0.0), ang("roll", "Roll (Z Axis)", 0.0)]),
@@ -1272,7 +1320,9 @@ mod tests {
         assert_eq!(n, 93);
         assert_eq!(CATALOGUE.len(), 16);
         // nothing else sits in the current folders
-        for d in effect_defs().iter().filter(|d| d.kind == EffectKind::Video && d.category.first() == Some(&"Video Effects")) {
+        for d in
+            effect_defs().iter().filter(|d| d.kind == EffectKind::Video && d.category.first() == Some(&"Video Effects") && !BEYOND_PREMIERE.contains(&d.id))
+        {
             let f = d.category[1];
             if f == "Obsolete" {
                 continue;

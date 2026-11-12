@@ -86,6 +86,357 @@ fn sample_dir(img: &Image, d: V3) -> [f32; 4] {
     sample_wrap(img, (lon / TAU + 0.5) * img.w as f64, (0.5 - lat / PI) * img.h as f64)
 }
 
+/// Widest view [`view_dir`] draws, degrees (a whole turn would put the antipode on every edge).
+pub const MAX_VIEW_FOV: f64 = 359.0;
+
+/// How a flat view maps the sphere ([`lens_dir`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Lens {
+    /// Straight when narrow, curving just enough to keep shapes in proportion as the view widens,
+    /// and [`Lens::Curve`]`(1.0)` by 180° ([`view_dir`]).
+    Auto,
+    /// The general perspective projection from a point `d` (0…1) behind the centre of the sphere:
+    /// 0 is straight (rectilinear: straight lines stay straight, up to 179°), 1 curved
+    /// (stereographic: round shapes stay round, the whole sphere but its antipode).
+    Curve(f64),
+    /// Equidistant fisheye: the distance from the centre is the angle from the view axis.
+    Fisheye,
+    /// Equisolid (a mirror ball's reflection): at 360° the whole sphere fills a disc.
+    MirrorBall,
+    /// Cylindrical panorama strip: longitude across, verticals stay vertical.
+    Panorama,
+}
+
+/// Shaping applied with a [`Lens`]: `twist` (degrees at the view's edge, turning with the
+/// distance from the centre), `stretch` (−100…100: wider or taller, keeping the area) and
+/// `center` (−100…100: the middle of the view, a little planet's ground, made bigger or smaller
+/// against its surroundings).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub twist: f64,
+    pub stretch: f64,
+    pub center: f64,
+}
+
+/// The direction seen at a point of a flat view of the sphere, looking down +Z with +Y up: `x`
+/// runs −1…1 across the view's width, `y` (up) is scaled the same (−h/w…h/w), `fov` is the
+/// horizontal field of view in degrees (1…[`MAX_VIEW_FOV`]).
+///
+/// Narrow views are rectilinear (pinhole); as the view widens it curves just enough to keep
+/// shapes near its edge in proportion ([`auto_curve`]), and by 180° it is the
+/// stereographic projection, which reaches the whole sphere but its antipode, so the view keeps
+/// zooming out without running off the picture: pointed at the nadir that is a "little planet"
+/// (outside in), at the zenith a "rabbit hole" (inside out). `None` past the sphere.
+pub fn view_dir(x: f64, y: f64, fov: f64) -> Option<[f64; 3]> {
+    lens_dir(x, y, fov, Lens::Auto, Shape::default())
+}
+
+/// [`view_dir`] through any [`Lens`], with [`Shape`]. `None` past what the lens reaches (the
+/// corners of a wide fisheye or mirror ball).
+pub fn lens_dir(x: f64, y: f64, fov: f64, lens: Lens, shape: Shape) -> Option<[f64; 3]> {
+    if !(x.is_finite() && y.is_finite()) {
+        return None;
+    }
+    let fin = |v: f64, lo: f64, hi: f64| if v.is_finite() { v.clamp(lo, hi) } else { 0.0 };
+    let fov = if fov.is_finite() { fov.clamp(1.0, 360.0) } else { 90.0 };
+    // Stretch (area-preserving), then Twist (a swirl growing towards the edge)
+    let k = 2f64.powf(fin(shape.stretch, -100.0, 100.0) / 100.0).sqrt();
+    let (x, y) = (x / k, y * k);
+    let r = x.hypot(y);
+    let (sa, ca) = (fin(shape.twist, -3600.0, 3600.0).to_radians() * r).sin_cos();
+    let (x, y) = (x * ca - y * sa, x * sa + y * ca);
+    let d = match lens {
+        Lens::Panorama => {
+            let half = (fov.min(MAX_VIEW_FOV) * 0.5).to_radians();
+            return Some(center_size(dir(x * half, (y * half).atan()), shape.center));
+        }
+        Lens::Fisheye => radial(x, y, (fov * 0.5).to_radians().min(PI), Some),
+        Lens::MirrorBall => {
+            let edge = 2.0 * (fov * 0.25).to_radians().sin();
+            radial(x, y, edge, |rho| ((rho * 0.5) <= 1.0).then(|| 2.0 * (rho * 0.5).asin()))
+        }
+        Lens::Auto => general(x, y, fov.min(MAX_VIEW_FOV), auto_curve(fov)),
+        Lens::Curve(d) => {
+            let d = fin(d, 0.0, 1.0);
+            // the widest view this curve reaches (2·acos(−d)), less a degree
+            let widest = (2.0 * (-d).acos().to_degrees() - 1.0).min(MAX_VIEW_FOV);
+            general(x, y, fov.min(widest), d)
+        }
+    }?;
+    Some(center_size(d, shape.center))
+}
+
+/// How much shapes may widen at the edge of an Automatic view: 15% (the ratio of the radial to
+/// the sideways magnification there).
+const AUTO_EDGE_STRETCH: f64 = 1.15;
+
+/// The curve (`d` of [`general`]) of an Automatic view `fov` degrees wide: straight while that
+/// keeps shapes at the view's edge within [`AUTO_EDGE_STRETCH`] (up to about 60°), then just
+/// curved enough to hold them there, and fully curved (stereographic) by 180°.
+///
+/// A straight (rectilinear) view widens shapes at its edge by 1 / cos θ (θ is the angle out from
+/// the view's centre): 41% at 90°, double at 120°, so zooming a straight view out stretches
+/// people near the edges. The general perspective projection widens them by
+/// (1 + d cos θ) / (d + cos θ); the smallest `d` that keeps that within the limit at the edge is
+/// (1 − A cos θ) / (A − cos θ).
+fn auto_curve(fov: f64) -> f64 {
+    let c = (fov.clamp(0.0, 360.0) * 0.5).to_radians().cos();
+    let a = AUTO_EDGE_STRETCH;
+    let natural = if fov >= 180.0 { 1.0 } else { ((1.0 - a * c) / (a - c)).clamp(0.0, 1.0) };
+    natural.max(f64::from(smoothstep(90.0, 180.0, fov as f32)))
+}
+
+/// A radially symmetric lens: `theta` turns the image-plane radius (the view's edge at `edge`)
+/// into the angle from the view axis.
+fn radial(x: f64, y: f64, edge: f64, theta: impl Fn(f64) -> Option<f64>) -> Option<V3> {
+    let r = x.hypot(y);
+    if r < 1e-12 {
+        return Some([0.0, 0.0, 1.0]);
+    }
+    let t = theta(r * edge).filter(|t| t.is_finite() && *t <= PI + 1e-9)?;
+    let st = t.sin();
+    Some([st * x / r, st * y / r, t.cos()])
+}
+
+/// The general perspective projection from `d` behind the centre: ρ = (d + 1) sin θ / (d + cos θ).
+fn general(x: f64, y: f64, fov: f64, d: f64) -> Option<V3> {
+    let half = (fov * 0.5).to_radians();
+    let k = d + 1.0;
+    let denom = d + half.cos();
+    if denom <= 1e-9 {
+        return None;
+    }
+    // ρ (d + cos θ) = k sin θ  ⇒  θ = atan2(ρ, k) + asin(ρ d / √(k² + ρ²))
+    radial(x, y, k * half.sin() / denom, |rho| {
+        let s = rho * d / k.hypot(rho);
+        (s <= 1.0).then(|| rho.atan2(k) + s.asin())
+    })
+}
+
+/// Planet Size: the angle from the view axis bent by a power curve (θ' = π (θ/π)^γ), so the
+/// middle of the view takes more (positive) or less of it.
+fn center_size(d: V3, amount: f64) -> V3 {
+    if !amount.is_finite() || amount.abs() < 1e-9 {
+        return d;
+    }
+    let gamma = 2f64.powf(amount.clamp(-100.0, 100.0) / 50.0);
+    let t = d[2].clamp(-1.0, 1.0).acos();
+    let r = d[0].hypot(d[1]);
+    if r < 1e-12 {
+        return d;
+    }
+    let t2 = PI * (t / PI).powf(gamma);
+    let st = t2.sin();
+    [st * d[0] / r, st * d[1] / r, t2.cos()]
+}
+
+/// The camera rotation of a view: roll about the view axis, then tilt (positive looks up), then
+/// pan (positive looks right), degrees.
+pub fn view_rotation(pan: f64, tilt: f64, roll: f64) -> [[f64; 3]; 3] {
+    rotation(-tilt, pan, roll)
+}
+
+/// Apply a [`view_rotation`] to a view direction (world direction = R · view direction).
+pub fn rotate(r: &[[f64; 3]; 3], d: [f64; 3]) -> [f64; 3] {
+    mvec(r, d)
+}
+
+/// Equirectangular coordinates (u 0…1 = longitude −180°…180°, v 0…1 = latitude 90°…−90°) of a
+/// direction.
+pub fn equirect_uv(d: [f64; 3]) -> (f64, f64) {
+    let (lon, lat) = lonlat(d);
+    (lon / TAU + 0.5, 0.5 - lat / PI)
+}
+
+/// A VR Reframe Lens option.
+fn lens_of(choice: u32, curve: f64) -> Lens {
+    match choice {
+        1 => Lens::Curve(0.0),
+        2 => Lens::Curve(1.0),
+        3 => Lens::Fisheye,
+        4 => Lens::MirrorBall,
+        5 => Lens::Panorama,
+        6 => Lens::Curve(curve / 100.0),
+        _ => Lens::Auto,
+    }
+}
+
+/// A VR Reframe View option's tilt and field of view: Custom, Little Planet (looking straight
+/// down), Rabbit Hole (straight up).
+fn view_of(choice: u32, fov: f64, planet_fov: f64) -> (f64, f64) {
+    match choice {
+        1 => (-90.0, planet_fov),
+        2 => (90.0, planet_fov),
+        _ => (0.0, fov),
+    }
+}
+
+/// The direction seen at (`x`, `y`) part-way (`f` 0…1) through a morph from lens `a` to lens
+/// `b`, and how much of the picture is there (a lens that can't reach the point fades out).
+fn morph_dir(x: f64, y: f64, fov: f64, (a, b, f): (Lens, Lens, f64), shape: Shape) -> Option<(V3, f32)> {
+    if f <= 0.0 || a == b {
+        return lens_dir(x, y, fov, a, shape).map(|d| (d, 1.0));
+    }
+    // a straight lens can't show a view as wide as a planet (it pinches to a point well before
+    // 180°): mid-morph, while the view widens, it curves at least as much as Automatic would
+    let fit = |l: Lens| match l {
+        Lens::Curve(d) => Lens::Curve(d.max(auto_curve(fov))),
+        other => other,
+    };
+    let (a, b) = (fit(a), fit(b));
+    match (lens_dir(x, y, fov, a, shape), lens_dir(x, y, fov, b, shape)) {
+        (Some(da), Some(db)) => {
+            let m = [0, 1, 2].map(|i| da[i] + (db[i] - da[i]) * f);
+            let n = dot(m, m).sqrt();
+            // opposite directions (a quarter of the antipode): take the nearer lens
+            if n < 1e-6 { Some((if f < 0.5 { da } else { db }, 1.0)) } else { Some((m.map(|c| c / n), 1.0)) }
+        }
+        (Some(da), None) => Some((da, (1.0 - f) as f32)),
+        (None, Some(db)) => Some((db, f as f32)),
+        (None, None) => None,
+    }
+}
+
+/// One VR Reframe view (A, or the split screen's B) at a moment: where it looks, how wide, and
+/// through which lens (or part-way between two).
+struct Cam {
+    r: M3,
+    fov: f64,
+    lenses: (Lens, Lens, f64),
+}
+
+/// The parameter ids of a view: View, Lens, Field of View, Planet Field of View, Pan, Tilt, Roll.
+const CAM_A: [&str; 7] = ["view", "lens", "fov", "planet_fov", "pan", "tilt", "roll"];
+/// The split screen's second view (its Field of View sizes its planets too).
+const CAM_B: [&str; 7] = ["view2", "lens2", "fov2", "fov2", "pan2", "tilt2", "roll2"];
+
+fn cam(e: &EffectInstance, cx: &FxCtx, ids: &[&str; 7]) -> Cam {
+    use super::reframe_motion::{choice_morph, reframe_value};
+    // (keyframe and pasted values are untrusted: reframe_value is always finite)
+    let deg = |id| reframe_value(e, id, cx.t);
+    let [view, lens, fov, planet_fov, pan, tilt, roll] = *ids;
+    let (va, vb, vf) = choice_morph(e, view, cx.t, 0);
+    let ((ta, fa), (tb, fb)) = (view_of(va, deg(fov), deg(planet_fov)), view_of(vb, deg(fov), deg(planet_fov)));
+    let (base_tilt, fov) = (ta + (tb - ta) * vf, fa + (fb - fa) * vf);
+    let r = view_rotation(deg(pan), base_tilt + deg(tilt), deg(roll));
+    let (la, lb, lf) = choice_morph(e, lens, cx.t, 0);
+    Cam { r, fov, lenses: (lens_of(la, deg("curve")), lens_of(lb, deg("curve")), lf) }
+}
+
+/// The colour `cam` sees at (`nx`, `ny`) of its view (x −1…1 across, y scaled the same).
+fn shade(src: &Image, cam: &Cam, shape: Shape, nx: f64, ny: f64) -> [f32; 4] {
+    match morph_dir(nx, ny, cam.fov, cam.lenses, shape) {
+        Some((d, a)) => sample_dir(src, mvec(&cam.r, d)).map(|c| c * a),
+        None => [0.0; 4],
+    }
+}
+
+/// The split screen at a moment: `axis` 1 top and bottom, 2 side by side; the divider at `at`
+/// (0…1 along the axis) softened over `soft` either side; which view is first (`order`: 0 A, 1
+/// B, part-way while they swap).
+struct Split {
+    axis: u32,
+    at: f64,
+    soft: f64,
+    order: (u32, u32, f64),
+}
+
+/// The colour at (`fx`, `fy`), 0…1 across the frame `aspect` (height / width) high, of the
+/// split screen with views `a` and `b`.
+fn split_px(src: &Image, (a, b): (&Cam, &Cam), sp: &Split, shape: Shape, (fx, fy): (f64, f64), aspect: f64) -> [f32; 4] {
+    let along = if sp.axis == 1 { fy } else { fx };
+    let first = if sp.soft > 0.0 {
+        1.0 - f64::from(smoothstep((sp.at - sp.soft) as f32, (sp.at + sp.soft) as f32, along as f32))
+    } else {
+        f64::from(u8::from(along < sp.at))
+    };
+    // a region's own view coordinates: x −1…1 across its width
+    let local = |lo: f64, hi: f64| {
+        let span = (hi - lo).max(1e-6);
+        if sp.axis == 1 {
+            (fx * 2.0 - 1.0, (1.0 - (fy - lo) / span * 2.0) * aspect * span)
+        } else {
+            ((fx - lo) / span * 2.0 - 1.0, (1.0 - fy * 2.0) * aspect / span)
+        }
+    };
+    let mix = |order: u32| {
+        let (c1, c2) = if order == 0 { (a, b) } else { (b, a) };
+        let mut o = [0.0f32; 4];
+        for (cam, lo, hi, w) in [(c1, 0.0, sp.at, first), (c2, sp.at, 1.0, 1.0 - first)] {
+            if w > 0.0 {
+                let (nx, ny) = local(lo, hi);
+                let c = shade(src, cam, shape, nx, ny);
+                for k in 0..4 {
+                    o[k] += c[k] * w as f32;
+                }
+            }
+        }
+        o
+    };
+    let (oa, ob, f) = sp.order;
+    let ca = mix(oa);
+    if f <= 0.0 || oa == ob {
+        return ca;
+    }
+    let cb = mix(ob);
+    [0, 1, 2, 3].map(|k| ca[k] + (cb[k] - ca[k]) * f as f32)
+}
+
+/// VR Reframe: a flat view of the sphere (a normal shot, a wide view, a little planet or a rabbit
+/// hole) that fills the sequence frame (the whole layer without a sequence, and for each eye of
+/// a stereoscopic layout). The layer is centred in the sequence 1:1 by Motion's defaults, so the
+/// view covers the sequence frame's rectangle in layer pixels and is transparent outside it.
+///
+/// The numbers move through their keyframes as [`super::reframe_motion`] says, and a change of
+/// View or Lens morphs over the time between its keyframes.
+///
+/// Split Screen shows a second view (B, with its own View, Lens, Field of View and aim) under or
+/// beside the first, each filling its part of the frame; the Order can be keyframed to swap them.
+fn reframe(img: &mut Image, e: &EffectInstance, cx: &FxCtx, layout: u32) {
+    use super::reframe_motion::{choice_morph, reframe_value};
+    let deg = |id| reframe_value(e, id, cx.t);
+    let target = match (layout, cx.env) {
+        (0, Some(env)) => {
+            let (sw, sh) = env.sequence_size();
+            let k = img.w as f64 / env.source_size().0.max(1) as f64;
+            Some((sw as f64 * k, sh as f64 * k))
+        }
+        _ => None,
+    };
+    let a = cam(e, cx, &CAM_A);
+    let shape = Shape { twist: deg("twist"), stretch: deg("stretch"), center: deg("planet_size") };
+    let split = match chv(e, "split") {
+        axis @ (1 | 2) => Some((
+            cam(e, cx, &CAM_B),
+            Split {
+                axis,
+                at: (deg("split_position") / 100.0).clamp(0.05, 0.95),
+                soft: (deg("split_feather") / 100.0).clamp(0.0, 0.25),
+                order: choice_morph(e, "split_order", cx.t, 0),
+            },
+        )),
+        _ => None,
+    };
+    per_view(img, layout, |v| {
+        let src = v.clone();
+        let (w, h) = (v.w, v.h);
+        let (tw, th) = target.filter(|(tw, th)| *tw >= 1.0 && *th >= 1.0).unwrap_or((w as f64, h as f64));
+        let (x0, y0) = ((w as f64 - tw) * 0.5, (h as f64 - th) * 0.5);
+        v.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (fx, fy) = ((x as f64 + 0.5 - x0) / tw, (y as f64 + 0.5 - y0) / th);
+                *px = if !((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)) {
+                    [0.0; 4]
+                } else if let Some((b, sp)) = &split {
+                    split_px(&src, (&a, b), sp, shape, (fx, fy), th / tw)
+                } else {
+                    shade(&src, &a, shape, fx * 2.0 - 1.0, (1.0 - fy * 2.0) * th / tw)
+                };
+            }
+        });
+    });
+}
+
 /// Run `f` on each view of the frame layout.
 fn per_view(img: &mut Image, layout: u32, f: impl Fn(&mut Image)) {
     let (w, h) = (img.w, img.h);
@@ -409,6 +760,7 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
                 });
             });
         }
+        "vr_reframe" => reframe(img, e, cx, layout),
         "vr_projection" | "vr_rotate_sphere" => {
             let r = rotation(fv(e, "tilt", cx) as f64, fv(e, "pan", cx) as f64, fv(e, "roll", cx) as f64);
             let fov = if e.effect == "vr_projection" { fv(e, "fov", cx) as f64 } else { 360.0 };

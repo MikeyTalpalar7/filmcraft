@@ -341,6 +341,26 @@ pub struct MonitorView {
     /// Snap in Program Monitor: graphic drags snap to guides, the frame edges and centre.
     pub snap: bool,
     pub guides: Vec<Guide>,
+    /// VR Video: show an equirectangular (360°) picture as a perspective view to look around in.
+    pub vr: VrView,
+}
+
+/// The VR Video view of a monitor (see `panels::vr_view`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VrView {
+    pub enabled: bool,
+    /// Where the view looks, degrees: yaw −180…180 (positive = right), pitch −90…90 (positive = up).
+    pub yaw: f32,
+    pub pitch: f32,
+    /// Horizontal field of view, degrees.
+    pub fov: f32,
+}
+
+impl Default for VrView {
+    fn default() -> Self {
+        Self { enabled: false, yaw: 0.0, pitch: 0.0, fov: crate::panels::vr_view::DEFAULT_FOV }
+    }
 }
 
 impl Default for MonitorView {
@@ -366,6 +386,7 @@ impl Default for MonitorView {
             lock_guides: false,
             snap: true,
             guides: Vec::new(),
+            vr: VrView::default(),
         }
     }
 }
@@ -439,6 +460,16 @@ pub struct KeyframeRef {
     pub time: filmcraft_time::Tick,
 }
 
+/// A Manual-keyframing aim on the Program monitor that isn't a keyframe yet: the VR Reframe
+/// instance, the playhead it was made at and the undo step (history depth) that shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VrPending {
+    pub clip: u64,
+    pub index: usize,
+    pub time: filmcraft_time::Tick,
+    pub depth: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
@@ -465,6 +496,10 @@ pub struct UiState {
     pub timeline: TimelineView,
     pub program: MonitorView,
     pub source: MonitorView,
+    /// The Source monitor clip the 360° check last ran for (a spherical clip turns VR Video on
+    /// once, when it opens).
+    #[serde(skip)]
+    pub source_vr_auto: Option<filmcraft_project::ItemId>,
     pub project_search: String,
     pub effects_search: String,
     /// Expanded bins in the project list view.
@@ -480,6 +515,27 @@ pub struct UiState {
     /// share of the panel). Dragging the divider sets it (#643).
     #[serde(default)]
     pub effect_controls_split: f32,
+    /// Effect Controls' keyframe area zoom: how many times the clip's length it is drawn (1 = the
+    /// whole clip fits; below 1 counts as 1), and where the view starts (a fraction of the clip).
+    #[serde(default)]
+    pub effect_controls_zoom: f32,
+    /// Aiming VR Reframe on the Program monitor: Manual keyframing (the aim only previews until
+    /// Set VR Keyframe, ⌥⇧K) instead of Auto (it keyframes at once, and records while playing).
+    #[serde(default)]
+    pub vr_keyframing_manual: bool,
+    /// Effect Controls: the user's order of each effect type's parameters (effect id → parameter
+    /// ids; the rest follow in the effect's own order).
+    #[serde(default)]
+    pub param_order: std::collections::BTreeMap<String, Vec<String>>,
+    /// Manual keyframing: an aim not set as a keyframe yet (the undo step that previews it).
+    #[serde(skip)]
+    pub vr_pending: Option<VrPending>,
+    #[serde(default)]
+    pub effect_controls_view: f32,
+    /// The keyframe area's visible left and right edges this frame (screen x), for rows that
+    /// draw in the zoomed lane.
+    #[serde(skip)]
+    pub effect_controls_visible: (f32, f32),
     pub show_menu_bar: bool,
     /// The header bar (Home, Import, Edit, Export, workspaces). An app that embeds FilmCraft can hide it.
     #[serde(default = "shown")]
@@ -913,6 +969,9 @@ pub struct SequenceSettingsDraft {
     pub working_space: String,
     pub wide_gamut: bool,
     pub auto_tone_map: bool,
+    /// Frame Size's Lock Ratio: the width and height whose ratio editing one side keeps (None:
+    /// unlocked).
+    pub lock_ratio: Option<(u32, u32)>,
 }
 
 impl Default for SequenceSettingsDraft {
@@ -937,6 +996,7 @@ impl Default for SequenceSettingsDraft {
             working_space: "rec709".into(),
             wide_gamut: false,
             auto_tone_map: true,
+            lock_ratio: None,
         }
     }
 }
@@ -1021,6 +1081,7 @@ impl Default for UiState {
             timeline: TimelineView::default(),
             program: MonitorView::default(),
             source: MonitorView::default(),
+            source_vr_auto: None,
             project_search: String::new(),
             effects_search: String::new(),
             expanded_bins: vec![],
@@ -1028,6 +1089,12 @@ impl Default for UiState {
             lumetri_grid_folder: None,
             collapsed_fx: vec![],
             effect_controls_split: 0.0,
+            effect_controls_zoom: 1.0,
+            vr_keyframing_manual: false,
+            param_order: Default::default(),
+            vr_pending: None,
+            effect_controls_view: 0.0,
+            effect_controls_visible: (0.0, f32::INFINITY),
             show_menu_bar: true,
             show_header: true,
             show_status_bar: true,

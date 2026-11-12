@@ -57,6 +57,8 @@ pub mod transition_controls;
 pub mod trim_monitor;
 pub mod tts;
 pub mod voiceover;
+pub mod vr_reframe_handles;
+pub mod vr_view;
 pub mod workspaces;
 
 use egui::{Align2, Color32, Rect};
