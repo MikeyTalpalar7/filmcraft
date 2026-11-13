@@ -1804,18 +1804,31 @@ fn smooth_motion_eases_through_keyframes_without_stopping_or_overshooting() {
     assert!((at(&e, 50) - 5.0).abs() < 1e-9);
 }
 
+/// Pan turns the way its keyframes say, not the short way: from 0° to −180° it turns left
+/// (through −90°), to 180° right, and from 170° to −170° the long way round (340°) unless the
+/// keyframe says 190°. Roll the same.
 #[test]
-fn pan_takes_the_short_way_round() {
+fn pan_turns_the_way_its_keyframes_say() {
     use crate::vfx::reframe_value;
     for smooth in [true, false] {
-        let mut e = inst("vr_reframe");
-        set(&mut e, "smooth", ParamValue::Bool(smooth));
-        keyed(&mut e, "pan", &[(0, ParamValue::Float(170.0)), (100, ParamValue::Float(-170.0))]);
-        for t in 0..=100 {
-            let v = reframe_value(&e, "pan", Tick(t));
-            assert!((170.0 - 1e-9..=190.0 + 1e-9).contains(&v), "{smooth} {t}: {v}");
+        for id in ["pan", "roll", "pan2"] {
+            let mid = |from: f64, to: f64| {
+                let mut e = inst("vr_reframe");
+                set(&mut e, "smooth", ParamValue::Bool(smooth));
+                keyed(&mut e, id, &[(0, ParamValue::Float(from)), (100, ParamValue::Float(to))]);
+                // every value between the two keyframes, never past them
+                for t in 0..=100 {
+                    let v = reframe_value(&e, id, Tick(t));
+                    assert!((from.min(to) - 1e-9..=from.max(to) + 1e-9).contains(&v), "{smooth} {id} {from}→{to} at {t}: {v}");
+                }
+                reframe_value(&e, id, Tick(50))
+            };
+            assert!((mid(0.0, -180.0) + 90.0).abs() < 1e-9, "left");
+            assert!((mid(0.0, 180.0) - 90.0).abs() < 1e-9, "right");
+            assert!((mid(170.0, -170.0)).abs() < 1e-9, "the long way, as keyed");
+            assert!((mid(170.0, 190.0) - 180.0).abs() < 1e-9, "across the back");
+            assert!((mid(0.0, 720.0) - 360.0).abs() < 1e-9, "two turns");
         }
-        assert!((reframe_value(&e, "pan", Tick(50)) - 180.0).abs() < 1e-9);
     }
 }
 

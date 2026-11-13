@@ -7,15 +7,14 @@
 //! keyframe set to Hold still holds. View and Lens keyframes morph from one into the next over the
 //! time between them instead of cutting (a Hold keyframe still cuts).
 //!
-//! Pan and Roll take the short way round: a pan from 170° to −170° turns 20°, not 340°.
+//! Pan and Roll turn the way their keyframes say: from 0° to −180° turns left, to 180° right,
+//! and to 720° twice round. (Dragging on the Program monitor keeps counting past ±180°, so a drag
+//! across the back of the sphere stays a short, continuous turn.)
 //!
 //! Smooth Motion off, the numbers follow their keyframes' own interpolation (Linear, Bezier…).
 
 use filmcraft_project::{EffectInstance, Interpolation, Keyframe, Param};
 use filmcraft_time::Tick;
-
-/// Angles that wrap: they take the short way between keyframes.
-const WRAPPING: &[&str] = &["pan", "roll", "pan2", "roll2"];
 
 /// Whether the instance moves smoothly through its keyframes (the Smooth Motion checkbox; on by
 /// default and when absent).
@@ -27,30 +26,21 @@ pub fn smooth(e: &EffectInstance) -> bool {
 /// non-finite one).
 pub fn reframe_value(e: &EffectInstance, id: &str, t: Tick) -> f64 {
     let v = match e.param(id).filter(|p| p.keyframes.len() >= 2) {
-        Some(p) => track(p, t, smooth(e), WRAPPING.contains(&id)).unwrap_or_else(|| e.f64_at(id, t)),
+        Some(p) => track(p, t, smooth(e)).unwrap_or_else(|| e.f64_at(id, t)),
         None => e.f64_at(id, t),
     };
     if v.is_finite() { v } else { 0.0 }
 }
 
-/// The keyframes' values, each wrapping one turned by whole turns to within half a turn of the
-/// one before it.
-fn values(k: &[Keyframe], wrap: bool) -> Vec<f64> {
-    let mut out: Vec<f64> = Vec::with_capacity(k.len());
-    for kf in k {
-        let mut v = kf.value.as_f64().filter(|v| v.is_finite()).unwrap_or(0.0);
-        if let (true, Some(&prev)) = (wrap, out.last()) {
-            v = prev + (v - prev + 180.0).rem_euclid(360.0) - 180.0;
-        }
-        out.push(v);
-    }
-    out
+/// The keyframes' values (0 for a non-number or non-finite one).
+fn values(k: &[Keyframe]) -> Vec<f64> {
+    k.iter().map(|kf| kf.value.as_f64().filter(|v| v.is_finite()).unwrap_or(0.0)).collect()
 }
 
 /// `p` at `t` (None: let the parameter evaluate itself).
-fn track(p: &Param, t: Tick, smooth: bool, wrap: bool) -> Option<f64> {
+fn track(p: &Param, t: Tick, smooth: bool) -> Option<f64> {
     let k = &p.keyframes;
-    let v = values(k, wrap);
+    let v = values(k);
     let (first, last) = (k.first()?, k.last()?);
     if t <= first.time {
         return v.first().copied();
@@ -71,13 +61,8 @@ fn track(p: &Param, t: Tick, smooth: bool, wrap: bool) -> Option<f64> {
         return Some(va);
     }
     if !smooth {
-        if !wrap {
-            return None;
-        }
-        // the parameter's own easing, along the short way round
-        let (ra, rb, rt) = (a.value.as_f64()?, b.value.as_f64()?, p.f64_at(t));
-        let f = if (rb - ra).abs() > 1e-12 { (rt - ra) / (rb - ra) } else { u };
-        return Some(va + (vb - va) * f);
+        // the parameter's own easing (Linear, Bezier…)
+        return None;
     }
     let (ma, mb) = (slope(k, &v, i), slope(k, &v, i + 1));
     // cubic Hermite in seconds-free units: slopes are per tick, scaled by the span

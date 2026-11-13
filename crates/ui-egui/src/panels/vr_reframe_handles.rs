@@ -100,13 +100,18 @@ fn zoom_param(e: &EffectInstance, mt: Tick, ids: Ids) -> (&'static str, f64, f64
     if (if f > 0.0 { to } else { from }) == 0 || ids.fov == ids.planet_fov { (ids.fov, 10.0, 360.0) } else { (ids.planet_fov, 90.0, 360.0) }
 }
 
+/// The largest Pan or Roll a drag reaches (Effect Controls' angle range).
+const MAX_TURN: f64 = 36_000.0;
+
 /// The new angles after a drag of `moved` points across a picture `width` points wide: the
-/// picture follows the pointer (dragging left looks right), by the field of view per width.
+/// picture follows the pointer (dragging left looks right), by the field of view per width. Pan
+/// and Roll keep counting past ±180° (to Effect Controls' ±36000°), so a drag across the back of
+/// the sphere keyframes a short, continuous turn: Pan and Roll turn the way their keyframes say.
 fn dragged(a: &Aim, moved: egui::Vec2, roll: bool) -> (f64, f64, f64) {
     let width = a.width;
     let per = if width > 0.0 { a.fov / f64::from(width) } else { 0.0 };
     let (dx, dy) = (f64::from(moved.x) * per, f64::from(moved.y) * per);
-    let wrap = |v: f64| if v.is_finite() { (v + 180.0).rem_euclid(360.0) - 180.0 } else { 0.0 };
+    let wrap = |v: f64| if v.is_finite() { v.clamp(-MAX_TURN, MAX_TURN) } else { 0.0 };
     if roll { (a.pan, a.tilt, wrap(a.roll + dx)) } else { (wrap(a.pan - dx), (a.tilt + dy).clamp(-180.0, 180.0), a.roll) }
 }
 
@@ -431,10 +436,15 @@ mod tests {
     }
 
     #[test]
-    fn dragging_follows_the_pointer_and_wraps() {
-        // a whole picture width to the left turns the view right by its field of view (and wraps)
+    fn dragging_follows_the_pointer_and_keeps_counting() {
+        // a whole picture width to the left turns the view right by its field of view, past 180°
+        // (170° + 100° = 270°, not −90°: keyframed, it turns on to the right)
         let (pan, tilt, roll) = dragged(&aim(), vec2(-200.0, 0.0), false);
-        assert!((pan - -90.0).abs() < 1e-9 && tilt == 10.0 && roll == 0.0, "{pan}");
+        assert!((pan - 270.0).abs() < 1e-9 && tilt == 10.0 && roll == 0.0, "{pan}");
+        let (_, _, roll) = dragged(&Aim { roll: -170.0, ..aim() }, vec2(-100.0, 0.0), true);
+        assert!((roll - -220.0).abs() < 1e-9, "{roll}");
+        let (pan, _, _) = dragged(&Aim { pan: 35_990.0, ..aim() }, vec2(-1e6, 0.0), false);
+        assert_eq!(pan, MAX_TURN);
         // down looks up; tilt stops at ±180°
         let (_, tilt, _) = dragged(&aim(), vec2(0.0, 1e6), false);
         assert_eq!(tilt, 180.0);
