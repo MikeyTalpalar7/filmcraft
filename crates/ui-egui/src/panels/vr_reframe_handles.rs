@@ -87,6 +87,9 @@ struct Aim {
     tilt: f64,
     roll: f64,
     fov: f64,
+    /// The tilt the view itself starts from (0 Custom, −90 Little Planet, 90 Rabbit Hole): Tilt
+    /// stops where the two together look straight up or down.
+    base: f64,
     /// The drag has sent its first change (the one that starts its undo step).
     begun: bool,
     /// Auto keyframing while playing: the playhead (ticks) of the last recorded keyframe.
@@ -110,9 +113,36 @@ const MAX_TURN: f64 = 36_000.0;
 fn dragged(a: &Aim, moved: egui::Vec2, roll: bool) -> (f64, f64, f64) {
     let width = a.width;
     let per = if width > 0.0 { a.fov / f64::from(width) } else { 0.0 };
-    let (dx, dy) = (f64::from(moved.x) * per, f64::from(moved.y) * per);
+    let finite = |v: f64| if v.is_finite() { v } else { 0.0 };
+    let (dx, dy) = (finite(f64::from(moved.x) * per), finite(f64::from(moved.y) * per));
     let wrap = |v: f64| if v.is_finite() { v.clamp(-MAX_TURN, MAX_TURN) } else { 0.0 };
-    if roll { (a.pan, a.tilt, wrap(a.roll + dx)) } else { (wrap(a.pan - dx), (a.tilt + dy).clamp(-180.0, 180.0), a.roll) }
+    if roll {
+        return (a.pan, a.tilt, wrap(a.roll + dx));
+    }
+    // the drag in the rolled picture's own directions (x right, y up), so the picture follows the
+    // pointer however the view is rolled
+    let (s, c) = if a.roll.is_finite() { a.roll.to_radians().sin_cos() } else { (0.0, 1.0) };
+    let (u, v) = (dx, -dy);
+    let (u, v) = (u * c - v * s, u * s + v * c);
+    // never past straight up or down: the view would turn upside down and every drag after it
+    // would move the picture the wrong way
+    let base = if a.base.is_finite() { a.base } else { 0.0 };
+    let tilt = if a.tilt.is_finite() { a.tilt } else { 0.0 };
+    // looking up or down, a turn sweeps less of the picture across: turn more to keep up (up to
+    // twice, 60° off level, so the poles don't spin)
+    let across = (base + tilt).to_radians().cos().abs().max(0.5);
+    (wrap(a.pan - u / across), (tilt - v).clamp(-90.0 - base, 90.0 - base), a.roll)
+}
+
+/// The tilt view `ids`' View starts from at media time `mt` (heading to the next one mid-morph):
+/// 0 for Custom, −90 for Little Planet (looking down), 90 for Rabbit Hole (up).
+fn base_tilt(e: &EffectInstance, mt: Tick, ids: Ids) -> f64 {
+    let (from, to, f) = filmcraft_render::vfx::reframe_choice(e, ids.view, mt, 0);
+    match if f > 0.0 { to } else { from } {
+        1 => -90.0,
+        2 => 90.0,
+        _ => 0.0,
+    }
 }
 
 /// The new field of view after a wheel step of `scroll` points, within `lo`…`hi`.
@@ -322,7 +352,8 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect) {
     let left = egui::PointerButton::Primary;
     if resp.drag_started_by(left) {
         let from = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).unwrap_or(pic.center());
-        let aim = Aim { clip, index, ids, width, from, pan: at(ids.pan), tilt: at(ids.tilt), roll: at(ids.roll), fov, begun: false, recorded: i64::MIN };
+        let base = base_tilt(&e, mt, ids);
+        let aim = Aim { clip, index, ids, width, from, pan: at(ids.pan), tilt: at(ids.tilt), roll: at(ids.roll), fov, base, begun: false, recorded: i64::MIN };
         ui.data_mut(|d| d.insert_temp(id, aim));
     }
     let aim: Option<Aim> = ui.data(|d| d.get_temp(id)).filter(|a: &Aim| a.clip == clip && a.index == index);
@@ -430,24 +461,82 @@ mod tests {
             tilt: 10.0,
             roll: 0.0,
             fov: 100.0,
+            base: 0.0,
             begun: false,
             recorded: i64::MIN,
         }
     }
 
+    /// Where a world direction seen at view point `p` (x −1…1 across, y up) of a view with these
+    /// angles shows up in a view with the new angles, by searching the view (the view's own maths
+    /// is one way only).
+    fn seen_at(world: [f64; 3], (pan, tilt, roll): (f64, f64, f64), fov: f64) -> (f64, f64) {
+        use filmcraft_render::vfx::{rotate_view, view_dir, view_rotation};
+        let r = view_rotation(pan, tilt, roll);
+        let mut best = (f64::MAX, (0.0, 0.0));
+        for i in -200..=200 {
+            for j in -200..=200 {
+                let (x, y) = (f64::from(i) / 200.0, f64::from(j) / 200.0);
+                let Some(d) = view_dir(x, y, fov) else { continue };
+                let w = rotate_view(&r, d);
+                let e = (0..3).map(|k| (w[k] - world[k]).powi(2)).sum::<f64>();
+                if e < best.0 {
+                    best = (e, (x, y));
+                }
+            }
+        }
+        best.1
+    }
+
+    /// The picture follows the pointer, rolled or not, looking up or down: what was under the
+    /// pointer moves the way the pointer did (the drag maps a turn, not a pixel shift, so only the
+    /// direction is checked).
+    #[test]
+    fn the_picture_follows_the_pointer_however_the_view_is_rolled() {
+        use filmcraft_render::vfx::{rotate_view, view_dir, view_rotation};
+        for roll in [0.0, 30.0, 90.0, -135.0] {
+            for tilt in [0.0, 40.0, -60.0] {
+                let a = Aim { pan: 20.0, tilt, roll, fov: 90.0, width: 400.0, ..aim() };
+                // a small drag right and down (screen points, y down)
+                for (mx, my) in [(12.0f32, 0.0f32), (0.0, 12.0), (-9.0, 7.0)] {
+                    let world = rotate_view(&view_rotation(a.pan, a.tilt, a.roll), view_dir(0.0, 0.0, 90.0).unwrap());
+                    let after = dragged(&a, vec2(mx, my), false);
+                    let (x, y) = seen_at(world, after, 90.0);
+                    // view x right, y up: the screen drag (mx, −my)
+                    let (ex, ey) = (f64::from(mx), -f64::from(my));
+                    let dot = (x * ex + y * ey) / ((x * x + y * y).sqrt() * (ex * ex + ey * ey).sqrt());
+                    assert!(dot > 0.95, "roll {roll} tilt {tilt} drag ({mx}, {my}): moved to ({x:.3}, {y:.3})");
+                }
+            }
+        }
+    }
+
+    /// Dragging never tips the view past straight up or down (it would turn upside down and the
+    /// drags after it would go the wrong way), in a planet view too.
+    #[test]
+    fn tilt_stops_at_straight_up_and_down() {
+        assert_eq!(dragged(&aim(), vec2(0.0, 1e6), false).1, 90.0);
+        assert_eq!(dragged(&aim(), vec2(0.0, -1e6), false).1, -90.0);
+        let planet = Aim { base: -90.0, tilt: 30.0, ..aim() };
+        assert_eq!(dragged(&planet, vec2(0.0, -1e6), false).1, 0.0, "a little planet stops looking straight down");
+        assert_eq!(dragged(&planet, vec2(0.0, 1e6), false).1, 180.0);
+        // a view already upside down comes back the right way up on the next drag
+        assert_eq!(dragged(&Aim { tilt: 150.0, ..aim() }, vec2(1.0, 0.0), false).1, 90.0);
+    }
+
     #[test]
     fn dragging_follows_the_pointer_and_keeps_counting() {
-        // a whole picture width to the left turns the view right by its field of view, past 180°
-        // (170° + 100° = 270°, not −90°: keyframed, it turns on to the right)
+        // a whole picture width to the left turns the view right by its field of view (a little
+        // more, tilted 10°), past 180° (about 270°, not −90°: keyframed, it turns on to the right)
         let (pan, tilt, roll) = dragged(&aim(), vec2(-200.0, 0.0), false);
-        assert!((pan - 270.0).abs() < 1e-9 && tilt == 10.0 && roll == 0.0, "{pan}");
+        assert!((pan - (170.0 + 100.0 / 10f64.to_radians().cos())).abs() < 1e-9 && tilt == 10.0 && roll == 0.0, "{pan}");
         let (_, _, roll) = dragged(&Aim { roll: -170.0, ..aim() }, vec2(-100.0, 0.0), true);
         assert!((roll - -220.0).abs() < 1e-9, "{roll}");
         let (pan, _, _) = dragged(&Aim { pan: 35_990.0, ..aim() }, vec2(-1e6, 0.0), false);
         assert_eq!(pan, MAX_TURN);
-        // down looks up; tilt stops at ±180°
+        // down looks up; tilt stops at straight up
         let (_, tilt, _) = dragged(&aim(), vec2(0.0, 1e6), false);
-        assert_eq!(tilt, 180.0);
+        assert_eq!(tilt, 90.0);
         // ⌥ rolls instead
         let (pan, _, roll) = dragged(&aim(), vec2(50.0, 0.0), true);
         assert!(pan == 170.0 && (roll - 25.0).abs() < 1e-9);
