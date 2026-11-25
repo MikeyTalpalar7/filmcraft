@@ -341,7 +341,8 @@ fn auto_save_ring_rotates_and_can_save_the_project() {
     let proj = d.join("ring.fcproj").to_string_lossy().to_string();
     let mut s = demo();
     start(&mut s, &d);
-    s.execute("prefs.set", json!({"values": {"autoSave.maxVersions": 2}})).unwrap();
+    // (saving the project itself is on by default: off here, to see the copies alone first)
+    s.execute("prefs.set", json!({"values": {"autoSave.maxVersions": 2, "autoSave.saveCurrentProject": false}})).unwrap();
     s.execute("file.saveAs", json!({"path": proj})).unwrap();
     // Nothing unsaved: no auto-save.
     assert!(s.execute("file.autoSaveNow", json!({})).unwrap()["path"].is_null());
@@ -361,7 +362,7 @@ fn auto_save_ring_rotates_and_can_save_the_project() {
     let mut t = Session::default();
     t.execute("file.open", json!({"path": written[2]})).unwrap();
     assert_eq!(*t.project, *s.project);
-    assert!(s.is_dirty(), "auto-save does not save the project itself by default");
+    assert!(s.is_dirty(), "with Save Current Project off, auto-save leaves the project unsaved");
     s.execute("prefs.set", json!({"key": "autoSave.saveCurrentProject", "value": true})).unwrap();
     s.execute("sequence.addEdit", json!({"seconds": 5.0})).unwrap();
     s.execute("file.autoSaveNow", json!({})).unwrap();
@@ -524,4 +525,16 @@ fn project_captured_folder_outside_the_project_is_not_used() {
     assert_eq!(crate::voiceover::media_dir(&s, &serde_json::Value::Null, "Captured").unwrap(), inner);
     assert!(s.execute("file.projectSettings.scratchDisks", json!({"captured": "file://192.0.2.1/s/cap"})).is_err());
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Auto Save saves the current project too by default (every 5 minutes), and a new install starts
+/// with an empty project and auto captions on the most accurate model, detecting the language.
+#[test]
+fn defaults_save_the_project_start_empty_and_caption_with_whisper_small() {
+    let p = crate::autosave::Preferences::default();
+    assert!(p.auto_save.enabled && p.auto_save.save_current_project);
+    assert_eq!(p.auto_save.interval_minutes, 5);
+    assert_eq!(p.general.at_startup, "emptyProject");
+    assert_eq!(p.media_analysis.whisper_model, "whisper-small");
+    assert!(p.media_analysis.language_auto_detect);
 }

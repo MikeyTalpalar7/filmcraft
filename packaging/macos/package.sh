@@ -59,7 +59,7 @@ if [[ "$SKIP_BUILD" = 0 ]]; then
   args=()
   for t in "${TARGETS[@]}"; do args+=(--target "$t"); done
   # Official packages include Kokoro natural voices (downloaded on first use). #2318 #3773
-  (cd "$ROOT" && cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/neural-voices "${args[@]}")
+  (cd "$ROOT" && cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/neural-voices,filmcraft/whisper "${args[@]}")
 fi
 
 rm -rf "$WORK"

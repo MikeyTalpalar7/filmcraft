@@ -63,7 +63,7 @@ impl Default for AutoSavePrefs {
             enabled: true,
             interval_minutes: 5,
             max_versions: 20,
-            save_current_project: false,
+            save_current_project: true,
             recovery_journal: true,
             recovery_interval_seconds: 5,
             scratch_folders: Vec::new(),
