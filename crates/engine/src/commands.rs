@@ -4038,6 +4038,33 @@ fn build() -> Vec<CommandSpec> {
             crate::keyframe_move::delete_many
         ),
         cmd!(
+            "effects.copyKeyframes",
+            "Copy Keyframes",
+            [],
+            None,
+            r#"{"keyframes":[{"clip":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}]}"#,
+            has_seq,
+            crate::keyframe_clipboard::copy
+        ),
+        cmd!(
+            "effects.cutKeyframes",
+            "Cut Keyframes",
+            [],
+            None,
+            r#"{"keyframes":[{"clip":id,"effect":index,"param":str,"mask":n?,"time":mediaTicks}]}"#,
+            has_seq,
+            crate::keyframe_clipboard::cut
+        ),
+        cmd!(
+            "effects.pasteKeyframes",
+            "Paste Keyframes",
+            [],
+            None,
+            r#"{"clip":id?,"time":ticks? (sequence time of the first; default the playhead)}"#,
+            has_seq,
+            crate::keyframe_clipboard::paste
+        ),
+        cmd!(
             "effects.moveKeyframe",
             "Move Keyframe",
             [],

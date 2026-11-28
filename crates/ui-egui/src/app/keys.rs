@@ -556,3 +556,67 @@ mod keyframe_delete_key_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod keyframe_clipboard_key_tests {
+    use crate::dock::PanelKind;
+    use crate::state::KeyframeRef;
+    use egui::{Event, Key, Modifiers};
+    use filmcraft_project::ParamValue;
+    use serde_json::json;
+
+    fn press(app: &mut super::FilmcraftApp, events: Vec<Event>, modifiers: Modifiers) {
+        let mut input = egui::InputState::default();
+        input.modifiers = modifiers;
+        input.events = events;
+        let fire = app.match_shortcuts(&mut input, false, false, false);
+        app.fire_shortcuts(&egui::Context::default(), fire);
+    }
+
+    /// ⌘C / ⌘V / ⌘X in Effect Controls copy, paste (at the playhead, keeping their spacing and
+    /// values) and cut the selected keyframes, and leave the clips alone.
+    #[test]
+    fn copy_paste_and_cut_keyframes_with_the_keyboard() {
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+        s.execute("timeline.select", json!({"clips": [clip.0]})).unwrap();
+        let mut times = Vec::new();
+        for (seconds, scale) in [(0.5, 50.0), (1.0, 150.0)] {
+            s.execute("playhead.set", json!({"seconds": seconds})).unwrap();
+            s.execute("effects.setParam", json!({"clip": clip.0, "effect": "motion", "param": "scale", "value": scale, "keyframe": true})).unwrap();
+            times.push(s.active_sequence().unwrap().find_item(clip).unwrap().1.source_time_at(s.playhead()));
+        }
+        let clips = s.active_sequence().unwrap().video_tracks.iter().map(|t| t.items.len()).sum::<usize>();
+        let mut app = super::FilmcraftApp::new(s);
+        app.bindings = super::menus::bindings(&app);
+        let effect = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.effects.iter().position(|e| e.effect == "motion").unwrap();
+        let key = |time| KeyframeRef { clip: clip.0, effect, param: "scale".into(), mask: None, time };
+        let scale = |app: &super::FilmcraftApp| {
+            let it = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
+            it.effects[effect].params["scale"].keyframes.iter().map(|k| (k.time, k.value.clone())).collect::<Vec<_>>()
+        };
+        app.ui.focused = PanelKind::EffectControls;
+        app.ui.keyframe_selection = vec![key(times[0]), key(times[1])];
+        press(&mut app, vec![Event::Copy], Modifiers::COMMAND);
+        assert_eq!(app.session.state.keyframe_clipboard.len(), 2);
+        // paste 2 s later: two more, half a second apart, the same values, and selected
+        app.session.execute("playhead.set", json!({"seconds": 2.5})).unwrap();
+        let at = app.session.active_sequence().unwrap().find_item(clip).unwrap().1.source_time_at(app.session.playhead());
+        press(
+            &mut app,
+            vec![Event::Key { key: Key::V, physical_key: Some(Key::V), pressed: true, repeat: false, modifiers: Modifiers::COMMAND }],
+            Modifiers::COMMAND,
+        );
+        let k = scale(&app);
+        assert_eq!(k.len(), 4, "{k:?}");
+        assert_eq!(k[2], (at, ParamValue::Float(50.0)));
+        assert_eq!(k[3], (filmcraft_time::Tick(at.0 + (times[1].0 - times[0].0)), ParamValue::Float(150.0)));
+        assert_eq!(app.ui.keyframe_selection.len(), 2);
+        // cut the first two: gone, and the clips are all still there
+        app.ui.keyframe_selection = vec![key(times[0]), key(times[1])];
+        press(&mut app, vec![Event::Cut], Modifiers::COMMAND);
+        assert_eq!(scale(&app).len(), 2);
+        assert_eq!(app.session.active_sequence().unwrap().video_tracks.iter().map(|t| t.items.len()).sum::<usize>(), clips);
+    }
+}

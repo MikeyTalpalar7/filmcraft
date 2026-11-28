@@ -15,13 +15,13 @@ const MAX_KEYS: usize = 4096;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
-struct Key {
-    clip: u64,
-    effect: usize,
-    param: String,
+pub(crate) struct Key {
+    pub(crate) clip: u64,
+    pub(crate) effect: usize,
+    pub(crate) param: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    mask: Option<usize>,
-    time: Tick,
+    pub(crate) mask: Option<usize>,
+    pub(crate) time: Tick,
 }
 
 type Lane = (u64, usize, Option<usize>, String);

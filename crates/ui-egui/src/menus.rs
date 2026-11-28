@@ -231,6 +231,30 @@ pub fn invoke_command(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut
     if id == "program.vrReframe.setKeyframe" {
         return crate::panels::vr_reframe_handles::set_keyframe(app, ctx);
     }
+    // Copy / Cut with keyframes selected in Effect Controls copy those keyframes, and Paste there
+    // pastes copied keyframes at the playhead on the clip the panel shows (selecting them)
+    if app.ui.focused == PanelKind::EffectControls
+        && matches!(id, "edit.copy" | "edit.cut")
+        && let Some(keys) = crate::panels::effect_controls::delete_keyframes_params(app)
+    {
+        let cmd = if id == "edit.cut" { "effects.cutKeyframes" } else { "effects.copyKeyframes" };
+        let r = invoke(app, ctx, cmd, keys);
+        if r.is_ok() && id == "edit.cut" {
+            app.ui.keyframe_selection.clear();
+        }
+        return r;
+    }
+    if app.ui.focused == PanelKind::EffectControls && id == "edit.paste" && !app.session.state.keyframe_clipboard.is_empty() {
+        let shown = crate::panels::effect_controls::selected_clips(app);
+        let clip = shown.first().map(|(c, _, _)| c.0);
+        let r = invoke(app, ctx, "effects.pasteKeyframes", json!({"clip": clip}));
+        if let Ok(v) = &r
+            && let Some(keys) = v.get("keyframes").and_then(Value::as_array)
+        {
+            app.ui.keyframe_selection = keys.iter().filter_map(|k| serde_json::from_value(k.clone()).ok()).collect();
+        }
+        return r;
+    }
     // Delete with keyframes selected in Effect Controls deletes them, not the clip
     if id == "edit.clear"
         && let Some(keys) = crate::panels::effect_controls::delete_keyframes_params(app)

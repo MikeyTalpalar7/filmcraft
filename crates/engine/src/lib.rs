@@ -24,6 +24,7 @@ pub mod graphic_templates;
 pub mod graphics;
 pub mod interchange;
 pub mod keyboard;
+pub mod keyframe_clipboard;
 mod keyframe_move;
 mod marker_edit;
 mod marker_export;
@@ -466,6 +467,10 @@ pub struct EditorState {
     /// Sequence markers copied with the clipboard clips (start relative to the copied range).
     #[serde(skip)]
     pub clipboard_markers: Vec<filmcraft_project::Marker>,
+    /// Keyframes copied in Effect Controls ([`keyframe_clipboard`]), kept apart from the clip
+    /// clipboard so copying keyframes leaves copied clips alone.
+    #[serde(skip)]
+    pub keyframe_clipboard: Vec<keyframe_clipboard::CopiedKeyframe>,
     /// Transitions copied with the clipboard clips (#3450): those whose every clip is copied, with
     /// their track kind and relative track index (start relative to the copied range, `from`/`to`
     /// still the copied clips' original ids).
