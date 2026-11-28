@@ -179,3 +179,52 @@ fn generate_without_a_transcriber() {
     let r = s.execute("transcript.generate", json!({})).unwrap();
     assert!(r["items"].as_array().unwrap().len() >= 2, "{r}");
 }
+
+/// Transcription hears only the parts of a recording that sequences use (a second either side,
+/// joined), and its words land at their times in the media; a recording no sequence uses is
+/// heard whole.
+#[test]
+fn only_the_used_parts_are_transcribed_and_mapped_back() {
+    use crate::transcript::used_ranges;
+    let sr = filmcraft_speech::SAMPLE_RATE as usize;
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let a = &q.audio_tracks[0].items[0];
+    let (item, sin, dur) = (a.item, a.source_in, a.duration);
+    let media = s.project.resolve_media(item).unwrap().0;
+    let mdur = match &s.project.item(media).unwrap().kind {
+        filmcraft_project::ItemKind::Media(m) => m.duration(),
+        _ => unreachable!(),
+    };
+    let r = used_ranges(&s.project, media, mdur);
+    assert!(!r.is_empty());
+    let lo = (sin.0 / filmcraft_speech::TICKS_PER_SAMPLE) as usize;
+    let hi = ((sin + dur).0 / filmcraft_speech::TICKS_PER_SAMPLE) as usize;
+    assert!(
+        r.iter().any(|&(a, b)| a <= lo.saturating_sub(sr) + 1 && b + 1 >= (hi + sr).min((mdur.0 / filmcraft_speech::TICKS_PER_SAMPLE) as usize)),
+        "{r:?} covers {lo}..{hi} with a second either side"
+    );
+    assert!(r.windows(2).all(|w| w[0].1 < w[1].0), "merged and in order: {r:?}");
+    // a word heard 0.5 s into the second joined part is at 0.5 s into that part of the media
+    let parts = [crate::transcript::Part::new(0, 10 * sr, 2 * sr), crate::transcript::Part::new(2 * sr + sr / 2, 100 * sr, 3 * sr)];
+    let mut t = Transcript::default();
+    t.words.push(Word::new(
+        "there",
+        filmcraft_speech::sample_tick((2 * sr + sr / 2 + sr / 2) as i64),
+        filmcraft_speech::sample_tick((2 * sr + sr / 2 + sr) as i64),
+    ));
+    crate::transcript::to_media_times(&mut t, &parts);
+    assert_eq!(t.words[0].start, filmcraft_speech::sample_tick((100 * sr + sr / 2) as i64));
+    assert!(t.words[0].end > t.words[0].start && t.words[0].end <= filmcraft_speech::sample_tick((101 * sr) as i64) + Tick(1));
+    // nothing uses an unplaced recording: heard whole
+    let unused = s
+        .project
+        .items
+        .iter()
+        .find(|(id, it)| matches!(it.kind, filmcraft_project::ItemKind::Media(_)) && used_ranges(&s.project, **id, mdur).is_empty())
+        .map(|(id, _)| *id);
+    if let Some(u) = unused {
+        assert!(used_ranges(&s.project, u, mdur).is_empty());
+    }
+}

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use filmcraft_edit as edit;
 use filmcraft_edit::transcript::{self as tx, CaptionRules, SeqWord};
 use filmcraft_project::{CaptionFormat, CaptionTrack, ClipId, ItemId, ItemKind, Project, TrackId, Transcript};
-use filmcraft_speech::{Options, SpeechError, Transcriber};
+use filmcraft_speech::{Options, SpeechError, TICKS_PER_SAMPLE, Transcriber};
 use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, u64_p};
@@ -108,20 +108,122 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
     out
 }
 
-/// Mono 16 kHz audio of a media item (None: no audio).
-fn item_audio(s: &Session, item: ItemId) -> Option<Vec<f32>> {
+/// Margin kept around each used part of a recording (a word cut by the edit is heard whole).
+const USED_PAD_SECONDS: i64 = 1;
+/// Silence put between the parts joined for transcription, in samples (half a second).
+const PART_GAP: usize = filmcraft_speech::SAMPLE_RATE as usize / 2;
+
+/// The parts of media `item` (`dur` long) that the project's sequences use on audio tracks, in 16
+/// kHz samples: each clip's span of the media, a second wider either side, merged where they meet.
+/// Empty when no sequence uses it (then all of it is transcribed).
+pub(crate) fn used_ranges(p: &Project, item: ItemId, dur: Tick) -> Vec<(usize, usize)> {
+    let sr = filmcraft_speech::SAMPLE_RATE as i64;
+    let total = dur.to_units_floor(sr).max(0) as usize;
+    let pad = (USED_PAD_SECONDS * sr) as usize;
+    let mut spans: Vec<(usize, usize)> = audio_placements(p)
+        .filter_map(|(seq, clip, placed)| {
+            if p.resolve_media(placed).map(|(root, _, _)| root) != Some(item) {
+                return None;
+            }
+            let (_, it) = p.sequence(seq)?.find_item(clip)?;
+            if it.duration <= Tick::ZERO {
+                return None;
+            }
+            let (a, b) = (it.source_time_at(it.start), it.source_time_at(it.end() - Tick(1)));
+            let (lo, hi) = (a.min(b), a.max(b) + Tick(1));
+            let lo = lo.to_units_floor(sr).max(0) as usize;
+            let hi = (hi.0.saturating_add(TICKS_PER_SAMPLE - 1) / TICKS_PER_SAMPLE).max(0) as usize;
+            Some((lo.saturating_sub(pad), hi.saturating_add(pad).min(total)))
+        })
+        .filter(|(a, b)| a < b)
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+/// One used part in the joined audio: where it starts there, where in the media, how long (samples).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Part {
+    at: usize,
+    from: usize,
+    len: usize,
+}
+
+impl Part {
+    #[cfg(test)]
+    pub(crate) fn new(at: usize, from: usize, len: usize) -> Self {
+        Part { at, from, len }
+    }
+}
+
+/// Mono 16 kHz audio of `src` (`dur` long): the `ranges` joined with [`PART_GAP`] of silence
+/// between them, or all of it without ranges. None: no audio.
+fn read_parts(src: &filmcraft_media::SharedSource, dur: Tick, ranges: &[(usize, usize)]) -> Option<(Vec<f32>, Vec<Part>)> {
+    if !src.info().has_audio() {
+        return None;
+    }
+    let sr = filmcraft_speech::SAMPLE_RATE;
+    let whole = [(0usize, dur.to_units_floor(sr as i64).max(0) as usize)];
+    let ranges = if ranges.is_empty() { &whole[..] } else { ranges };
+    let (mut audio, mut parts) = (Vec::new(), Vec::new());
+    for &(a, b) in ranges {
+        if !parts.is_empty() {
+            audio.resize(audio.len() + PART_GAP, 0.0);
+        }
+        let buf = src.audio(i64::try_from(a).ok()?, b.saturating_sub(a), sr).ok()?;
+        let mono = filmcraft_speech::downmix(&buf.channels);
+        parts.push(Part { at: audio.len(), from: a, len: mono.len() });
+        audio.extend(mono);
+    }
+    Some((audio, parts))
+}
+
+/// A time in the joined audio of `parts` as media time: moved by its part's offset (a time in the
+/// silence after a part is held at that part's end).
+fn media_time(parts: &[Part], t: Tick) -> Tick {
+    let n = (t.0 / TICKS_PER_SAMPLE).max(0) as usize;
+    let i = parts.partition_point(|p| p.at <= n).saturating_sub(1);
+    let Some(p) = parts.get(i) else { return t };
+    let offset = sample_tick_of(p.from).0 - sample_tick_of(p.at).0;
+    let end = sample_tick_of(p.at + p.len);
+    let held = if i + 1 < parts.len() && t > end { end } else { t };
+    Tick(held.0.saturating_add(offset).max(0))
+}
+
+fn sample_tick_of(n: usize) -> Tick {
+    filmcraft_speech::sample_tick(i64::try_from(n).unwrap_or(i64::MAX / TICKS_PER_SAMPLE))
+}
+
+/// The words of a transcript of joined `parts` moved to their media times.
+pub(crate) fn to_media_times(tr: &mut Transcript, parts: &[Part]) {
+    // all of the media, from its start: nothing moves
+    if matches!(parts, [Part { at: 0, from: 0, .. }]) {
+        return;
+    }
+    for w in &mut tr.words {
+        let (start, last) = (media_time(parts, w.start), media_time(parts, Tick((w.end.0 - 1).max(w.start.0))));
+        w.start = start;
+        w.end = Tick(last.0.max(start.0) + 1);
+    }
+}
+
+/// Mono 16 kHz audio of the parts of media `item` that sequences use (all of it when none do).
+/// An installed transcriber (tests, agents bringing a transcript of the whole media) hears it all.
+fn item_audio(s: &Session, item: ItemId) -> Option<(Vec<f32>, Vec<Part>)> {
     let dur = match &s.project.item(item)?.kind {
         ItemKind::Media(m) => m.duration(),
         _ => return None,
     };
     let src = s.source(item)?;
-    if !src.info().has_audio() {
-        return None;
-    }
-    let sr = filmcraft_speech::SAMPLE_RATE;
-    let len = dur.to_units_floor(sr as i64).max(0) as usize;
-    let buf = src.audio(0, len, sr).ok()?;
-    Some(filmcraft_speech::downmix(&buf.channels))
+    let ranges = if s.transcriber.is_some() { Vec::new() } else { used_ranges(&s.project, item, dur) };
+    read_parts(&src, dur, &ranges)
 }
 
 fn speech_err(e: SpeechError) -> EngineError {
@@ -150,6 +252,12 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     if items.is_empty() {
         return Err(bad("transcript.generate", "nothing to transcribe (pass `items`, select clips, or open a sequence with audio)"));
     }
+    // Speech to text takes minutes on a long sequence: in the background, unless asked to wait
+    // (automatic transcription folds into the edit that placed the clips) or a transcriber is
+    // installed (tests, agents bringing their own transcripts)
+    if !bool_p(p, "wait").unwrap_or(false) && s.transcriber.is_none() && !cfg!(target_arch = "wasm32") {
+        return generate_in_background(s, p, items);
+    }
     let t = transcriber(s, p)?;
     // Settings ▸ Media Analysis & Transcription: language (or auto-detect) and speaker labelling
     let ma = &s.prefs.media_analysis;
@@ -165,11 +273,12 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut done: Vec<(ItemId, Transcript)> = Vec::new();
     let mut skipped = Vec::new();
     for item in items {
-        let Some(audio) = item_audio(s, item) else {
+        let Some((audio, parts)) = item_audio(s, item) else {
             skipped.push(item.0);
             continue;
         };
         let mut tr = t.transcribe(&audio, &opts, &mut |_, _| true).map_err(speech_err)?;
+        to_media_times(&mut tr, &parts);
         tr.normalize();
         done.push((item, tr));
     }
@@ -187,6 +296,174 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"items": report, "skipped": skipped}))
+}
+
+/// The transcription options of `p` over Settings ▸ Media Analysis & Transcription.
+fn options(s: &Session, p: &Value) -> Options {
+    let ma = &s.prefs.media_analysis;
+    let default_language = if ma.language_auto_detect { None } else { Some(ma.default_language.clone()) };
+    Options {
+        language: match str_p(p, "language") {
+            Some(l) => Some(l).filter(|l| !l.is_empty() && *l != "auto").map(str::to_string),
+            None => default_language,
+        },
+        diarize: bool_p(p, "diarize").unwrap_or(ma.speaker_labeling != "off"),
+        max_speakers: u64_p(p, "maxSpeakers").map(|n| n.clamp(1, 32) as usize).unwrap_or(Options::default().max_speakers),
+    }
+}
+
+/// A transcription running in the background ([`generate_in_background`]): its job and the
+/// document it belongs to; `out` holds the transcripts (and the items without audio) when done.
+pub struct PendingTranscribe {
+    job: u64,
+    epoch: u64,
+    out: Arc<std::sync::Mutex<Option<TranscribeOut>>>,
+}
+
+impl PendingTranscribe {
+    /// The job (in [`Session::jobs`]) that shows its progress.
+    pub fn job(&self) -> u64 {
+        self.job
+    }
+}
+
+type TranscribeOut = (Vec<(ItemId, Transcript)>, Vec<u64>);
+
+/// `transcript.generate` on a worker thread, as a job of the Progress panel (cancel stops it): the
+/// model loads, each clip's audio is read and transcribed there, and [`poll`] applies the
+/// transcripts as one undo step when it is done.
+fn generate_in_background(s: &mut Session, p: &Value, items: Vec<ItemId>) -> Result<Value> {
+    use std::sync::atomic::Ordering;
+    let model = str_p(p, "model").unwrap_or(&s.prefs.media_analysis.whisper_model).to_string();
+    if filmcraft_speech::models::find(&model).is_none() {
+        return Err(speech_err(SpeechError::UnknownModel(model)));
+    }
+    if !filmcraft_speech::available() {
+        return Err(EngineError::Other(NO_SPEECH.into()));
+    }
+    let dir = models_dir().ok_or_else(|| EngineError::Other("no data directory for speech models".into()))?;
+    let opts = options(s, p);
+    // the sources, lengths and used parts now; their audio is read on the worker
+    type Src = (filmcraft_media::SharedSource, Tick, Vec<(usize, usize)>);
+    let sources: Vec<(ItemId, Option<Src>)> = items
+        .iter()
+        .map(|&i| {
+            let dur = match s.project.item(i).map(|it| &it.kind) {
+                Some(ItemKind::Media(m)) => Some(m.duration()),
+                _ => None,
+            };
+            (i, dur.and_then(|d| Some((s.source(i).filter(|src| src.info().has_audio())?, d, used_ranges(&s.project, i, d)))))
+        })
+        .collect();
+    let n = sources.len();
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    let label = if n == 1 { "Transcribe".to_string() } else { format!("Transcribe {n} clips") };
+    let job = crate::Job { id, label: label.clone(), progress: Default::default(), result: Default::default() };
+    job.progress.total.store(n as u64 * 100, Ordering::Relaxed);
+    let out: Arc<std::sync::Mutex<Option<TranscribeOut>>> = Arc::default();
+    let (prog, res, sink) = (job.progress.clone(), job.result.clone(), out.clone());
+    let run = move || {
+        let lock = |m: &std::sync::Mutex<String>, v: String| *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = v;
+        let t0 = web_time::Instant::now();
+        lock(&prog.status, format!("Loading the speech model ({model})"));
+        let finish = |r: std::result::Result<(), String>| {
+            prog.finished.store(true, Ordering::Relaxed);
+            *res.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.map(|()| filmcraft_export::Report {
+                path: String::new(),
+                frames: n as u64,
+                seconds: t0.elapsed().as_secs_f64(),
+                bytes: 0,
+                render_fps: 0.0,
+                extra_files: Vec::new(),
+            }));
+        };
+        let t = match filmcraft_speech::load(&dir, &model) {
+            Ok(t) => t,
+            Err(e) => return finish(Err(e.to_string())),
+        };
+        let (mut done, mut skipped) = (Vec::new(), Vec::new());
+        for (k, (item, src)) in sources.into_iter().enumerate() {
+            if prog.cancel.load(Ordering::Relaxed) {
+                lock(&prog.status, "Stopped".into());
+                return finish(Err("stopped".into()));
+            }
+            let audio = src.and_then(|(src, dur, ranges)| {
+                lock(&prog.status, format!("Reading the audio of clip {} of {n}", k + 1));
+                read_parts(&src, dur, &ranges)
+            });
+            let Some((audio, parts)) = audio else {
+                skipped.push(item.0);
+                continue;
+            };
+            lock(&prog.status, if n == 1 { "Transcribing".to_string() } else { format!("Transcribing clip {} of {n}", k + 1) });
+            let base = k as u64 * 100;
+            let r = t.transcribe(&audio, &opts, &mut |f, _| {
+                let f = if f.is_finite() { f.clamp(0.0, 1.0) } else { 0.0 };
+                prog.done.store(base + (f * 100.0) as u64, Ordering::Relaxed);
+                !prog.cancel.load(Ordering::Relaxed)
+            });
+            match r {
+                Ok(mut tr) => {
+                    to_media_times(&mut tr, &parts);
+                    tr.normalize();
+                    done.push((item, tr));
+                }
+                Err(e) => return finish(Err(e.to_string())),
+            }
+            prog.done.store(base + 100, Ordering::Relaxed);
+        }
+        let words: usize = done.iter().map(|(_, t)| t.words.len()).sum();
+        lock(&prog.status, format!("Transcribed {} clip(s), {words} words", done.len()));
+        *sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((done, skipped));
+        finish(Ok(()));
+    };
+    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    s.jobs.push(job);
+    s.transcribe_jobs.push(PendingTranscribe { job: id, epoch: s.document_epoch, out });
+    std::thread::Builder::new().name("filmcraft-transcribe".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+    Ok(json!({"job": id, "items": n, "background": true}))
+}
+
+/// Apply the transcripts of finished background transcriptions (one undo step each) and drop
+/// those whose project was replaced. Called with the other job polls, once per UI frame, and
+/// before each top-level command of a headless session.
+pub fn poll(s: &mut Session) {
+    use std::sync::atomic::Ordering;
+    let mut i = 0;
+    while i < s.transcribe_jobs.len() {
+        let job = s.transcribe_jobs[i].job;
+        if s.transcribe_jobs[i].epoch != s.document_epoch {
+            if let Some(j) = s.jobs.iter().find(|j| j.id == job) {
+                j.progress.cancel.store(true, Ordering::Relaxed);
+            }
+            s.transcribe_jobs.remove(i);
+            continue;
+        }
+        let finished = s.jobs.iter().find(|j| j.id == job).is_none_or(|j| j.progress.finished.load(Ordering::Relaxed));
+        if !finished {
+            i += 1;
+            continue;
+        }
+        let pending = s.transcribe_jobs.remove(i);
+        let out = pending.out.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        match out {
+            Some((done, _)) if !done.is_empty() => {
+                // (a clip deleted meanwhile has nowhere to keep its transcript)
+                let done: Vec<(ItemId, Transcript)> = done.into_iter().filter(|(i, _)| s.project.item(*i).is_some()).collect();
+                if let Err(e) = s.edit("Transcribe", move |pr, _| {
+                    for (i, t) in done {
+                        pr.transcripts.insert(i, Arc::new(t));
+                    }
+                    Ok(())
+                }) {
+                    s.error_toast("transcript.generate", e.to_string());
+                }
+            }
+            Some(_) => s.error_toast("transcript.generate", "none of the clips has audio to transcribe"),
+            // failed or stopped: the job's own result says why
+            None => {}
+        }
+    }
 }
 
 /// Enabled audio placements, including media inside nested sequences, without recursive walks.
@@ -212,7 +489,7 @@ pub(crate) fn auto_transcribe_sequence_clips(s: &mut Session, before: &Project) 
     // Fold the transcript into the placement's undo step. Preserve the whole history, including
     // its bounded oldest entry and merge key; generate's own edit must not consume another slot.
     let history = s.history.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generate(s, &json!({"items": items}))))
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| generate(s, &json!({"items": items, "wait": true}))))
         .unwrap_or_else(|_| Err(EngineError::Other("internal error during automatic transcription (see the crash log); the clips were placed".into())));
     s.history = history;
     result.map(|_| ())

@@ -573,11 +573,20 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let c = rect.center();
         icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
         ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, tl!("Transcribe sequence"), Tokens::semibold(16.0), t.text);
-        let available = filmcraft_speech_available(app);
-        let note = if available {
-            tl!("Speech-to-text turns the dialogue into editable text.")
-        } else {
-            tl!("This build has no speech-to-text; import a transcript with transcript.set.")
+        // a transcription running in the background: its progress in place of the button
+        let running = app.session.transcribe_jobs.iter().find_map(|pj| {
+            let j = app.session.jobs.iter().find(|j| j.id == pj.job())?;
+            let st = j.progress.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            Some(format!("{st}… {:.0}%", j.progress.fraction() * 100.0))
+        });
+        if running.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        let available = filmcraft_speech_available(app) && running.is_none();
+        let note = match &running {
+            Some(r) => r.as_str(),
+            None if available => tl!("Speech-to-text turns the dialogue into editable text."),
+            None => tl!("This build has no speech-to-text; import a transcript with transcript.set."),
         };
         ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, note, Tokens::ui(12.0), t.text_dim);
         let r = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(200.0, 26.0));
@@ -590,7 +599,8 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             (true, false) => t.accent,
         };
         ui.painter().rect_filled(r, 13.0, fill);
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, tl!("Transcribe"), Tokens::semibold(12.0), if available { Color32::WHITE } else { t.text_dim });
+        let label = if running.is_some() { tl!("Transcribing…") } else { tl!("Transcribe") };
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, Tokens::semibold(12.0), if available { Color32::WHITE } else { t.text_dim });
         app.auto.add("text.transcript.generate", r, "Transcribe");
         if let Some(e) = app.auto.elements.last_mut() {
             e.enabled = Some(available);
