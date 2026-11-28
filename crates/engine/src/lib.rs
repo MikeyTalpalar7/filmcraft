@@ -622,6 +622,34 @@ impl Default for Session {
     }
 }
 
+/// A 360° clip placed in a sequence that is not itself 360° (2:1) gets VR Reframe, so it shows as
+/// a normal shot: in every sequence of `p`, each video clip that wasn't in it in `old`, whose
+/// media is spherical and which has no VR Reframe yet. 2:1 sequences (360° output) are left
+/// alone. Part of the edit that placed the clip (one undo step).
+fn auto_vr_reframe(old: &Project, p: &mut Project) {
+    let spherical = |item: ItemId| p.resolve_media(item).and_then(|(_, m, _)| m.info.video.as_ref()?.spherical).is_some();
+    let mut add: Vec<(ItemId, filmcraft_project::ClipId)> = Vec::new();
+    for (id, it) in &p.items {
+        let Some(q) = it.as_sequence() else { continue };
+        if u64::from(q.settings.width) == 2 * u64::from(q.settings.height) {
+            continue;
+        }
+        let before: std::collections::HashSet<filmcraft_project::ClipId> =
+            old.sequence(*id).map(|o| o.video_tracks.iter().flat_map(|t| t.items.iter().map(|i| i.id)).collect()).unwrap_or_default();
+        for i in q.video_tracks.iter().flat_map(|t| t.items.iter()) {
+            if !before.contains(&i.id) && !i.effects.iter().any(|e| e.effect == "vr_reframe") && spherical(i.item) {
+                add.push((*id, i.id));
+            }
+        }
+    }
+    let Some(def) = filmcraft_project::find_effect("vr_reframe") else { return };
+    for (seq, clip) in add {
+        if let Some((_, it)) = p.sequence_mut(seq).and_then(|q| q.find_item_mut(clip)) {
+            it.effects.push(def.instance());
+        }
+    }
+}
+
 impl Session {
     pub fn new(services: Arc<dyn Services>) -> Self {
         Self {
@@ -1021,6 +1049,7 @@ impl Session {
         let r = f(&mut p, &mut st)?;
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
+        auto_vr_reframe(&self.project, &mut p);
         let old = std::mem::replace(&mut self.project, Arc::new(p));
         self.history.undo.push((label.to_string(), old, self.command_origin.clone()));
         if self.history.undo.len() > self.history.limit {
@@ -1048,6 +1077,7 @@ impl Session {
         let r = f(&mut p, &mut st)?;
         self.refuse_self_nesting(&p)?;
         self.drop_orphan_transitions(&mut p);
+        auto_vr_reframe(&self.project, &mut p);
         self.project = Arc::new(p);
         self.state = st;
         self.drop_stale_gap();

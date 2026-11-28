@@ -280,3 +280,45 @@ fn toggle_animation_all_animates_every_parameter_in_one_undo_step() {
         assert!(s.execute("effects.toggleAnimationAll", p).is_err());
     }
 }
+
+/// A 360° clip placed in a sequence that isn't 360° (2:1) gets VR Reframe; in a 2:1 sequence it
+/// stays as it is, and a clip that already has it doesn't get a second.
+#[test]
+fn a_360_clip_gets_vr_reframe_in_a_flat_sequence() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let media =
+        s.project.items.iter().find(|(_, it)| matches!(&it.kind, filmcraft_project::ItemKind::Media(m) if m.info.video.is_some())).map(|(id, _)| *id).unwrap();
+    if let Some(filmcraft_project::ItemKind::Media(m)) = std::sync::Arc::make_mut(&mut s.project).items.get_mut(&media).map(|it| &mut it.kind) {
+        m.info.video.as_mut().unwrap().spherical = Some(Default::default());
+    }
+    let reframes = |s: &Session| -> Vec<usize> {
+        s.active_sequence()
+            .unwrap()
+            .video_tracks
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .map(|i| i.effects.iter().filter(|e| e.effect == "vr_reframe").count())
+            .collect()
+    };
+    let place = |s: &mut Session| {
+        s.execute("source.open", json!({"item": media.0})).unwrap();
+        s.execute("source.overwrite", json!({"ignoreMismatch": true})).unwrap();
+    };
+    // vertical 4K: added, and undone with the edit
+    s.execute("file.newSequence", json!({"name": "Vertical", "width": 2160, "height": 3840, "fps": 30})).unwrap();
+    place(&mut s);
+    assert_eq!(reframes(&s), [1]);
+    s.undo();
+    assert!(reframes(&s).is_empty());
+    s.redo();
+    assert_eq!(reframes(&s), [1]);
+    // placed again: the new clip gets one, the old one keeps its one
+    s.execute("playhead.set", json!({"seconds": 30.0})).unwrap();
+    place(&mut s);
+    assert_eq!(reframes(&s), [1, 1]);
+    // a 360° (2:1) sequence keeps the clip as it is
+    s.execute("file.newSequence", json!({"name": "360", "width": 3840, "height": 1920, "fps": 30})).unwrap();
+    place(&mut s);
+    assert_eq!(reframes(&s), [0]);
+}
