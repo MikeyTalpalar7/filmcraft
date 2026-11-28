@@ -65,6 +65,19 @@ impl FilmcraftApp {
                     r
                 })
             }
+            // File ▸ New ▸ Project asks where to keep the project first and saves it there, so
+            // Auto Save keeps it saved from the first edit. Cancel keeps the current project.
+            "file.newProject" => self.pick(FileDialog::SaveProject { name: "Untitled.fcproj".into() }, |app, paths| {
+                let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                let name = std::path::Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+                app.session.execute("file.newProject", json!({"name": name})).map_err(|e| e.to_string())?;
+                let r = app.session.execute("file.saveAs", json!({"path": path})).map_err(|e| e.to_string());
+                match &r {
+                    Ok(_) => crate::menus::saved_status(app, "file.saveAs", &path),
+                    Err(e) => app.ui.status = e.clone(),
+                }
+                r
+            }),
             "file.open" => self.pick(FileDialog::OpenProject, |app, paths| {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
                 if let Some(asked) = crate::panels::clip_dialogs::ask_before_open(app, &path) {
@@ -118,5 +131,40 @@ impl FilmcraftApp {
             };
             r
         })
+    }
+}
+
+#[cfg(test)]
+mod new_project_tests {
+    use serde_json::json;
+
+    /// File ▸ New ▸ Project asks where to keep the project and saves it there at once (so Auto Save
+    /// keeps saving it); cancelling the dialog keeps the current project.
+    #[test]
+    fn new_project_is_named_and_saved_first() {
+        let dir = std::env::temp_dir().join(format!("fc-newproj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Mitzpe Ramon.fcproj").to_string_lossy().into_owned();
+        let mut s = filmcraft_engine::Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        let mut app = crate::FilmcraftApp::new(s);
+        let ctx = egui::Context::default();
+        // cancelled: nothing changes
+        app.hooks.pick_save = Some(Box::new(|_| None));
+        let before = app.session.project.name.clone();
+        crate::menus::invoke_command(&mut app, &ctx, "file.newProject", json!({})).unwrap();
+        assert_eq!(app.session.project.name, before);
+        // named: a new, empty project, saved where chosen
+        let chosen = path.clone();
+        app.hooks.pick_save = Some(Box::new(move |suggested| {
+            assert_eq!(suggested, "Untitled.fcproj");
+            Some(chosen.clone())
+        }));
+        crate::menus::invoke_command(&mut app, &ctx, "file.newProject", json!({})).unwrap();
+        assert_eq!(app.session.project.name, "Mitzpe Ramon");
+        assert_eq!(app.session.path.as_deref(), Some(path.as_str()));
+        assert!(!app.session.is_dirty());
+        assert!(std::path::Path::new(&path).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

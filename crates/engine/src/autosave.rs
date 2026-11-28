@@ -61,7 +61,7 @@ impl Default for AutoSavePrefs {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_minutes: 5,
+            interval_minutes: 3,
             max_versions: 20,
             save_current_project: true,
             recovery_journal: true,

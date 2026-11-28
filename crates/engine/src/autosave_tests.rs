@@ -136,7 +136,7 @@ fn preferences_get_set_and_persist() {
     let d = temp_dir("prefs");
     let mut s = Session::default();
     start(&mut s, &d);
-    assert_eq!(s.execute("prefs.get", json!({"key": "autoSave.intervalMinutes"})).unwrap(), json!(5));
+    assert_eq!(s.execute("prefs.get", json!({"key": "autoSave.intervalMinutes"})).unwrap(), json!(3));
     assert_eq!(s.execute("prefs.get", json!({"key": "autoSave.maxVersions"})).unwrap(), json!(20));
     s.execute("prefs.set", json!({"key": "autoSave.intervalMinutes", "value": 12.0})).unwrap();
     s.execute("prefs.set", json!({"values": {"autoSave.maxVersions": 5000, "autoSave.saveCurrentProject": true}})).unwrap();
@@ -527,13 +527,13 @@ fn project_captured_folder_outside_the_project_is_not_used() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// Auto Save saves the current project too by default (every 5 minutes), and a new install starts
+/// Auto Save saves the current project too by default (every 3 minutes), and a new install starts
 /// with an empty project and auto captions on the most accurate model, detecting the language.
 #[test]
 fn defaults_save_the_project_start_empty_and_caption_with_whisper_small() {
     let p = crate::autosave::Preferences::default();
     assert!(p.auto_save.enabled && p.auto_save.save_current_project);
-    assert_eq!(p.auto_save.interval_minutes, 5);
+    assert_eq!(p.auto_save.interval_minutes, 3);
     assert_eq!(p.general.at_startup, "emptyProject");
     assert_eq!(p.media_analysis.whisper_model, "whisper-small");
     assert!(p.media_analysis.language_auto_detect);
