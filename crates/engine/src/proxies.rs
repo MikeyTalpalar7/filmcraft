@@ -790,3 +790,53 @@ fn has_file_media(s: &Session) -> std::result::Result<(), String> {
         Err("the project has no file-based media".into())
     }
 }
+
+/// The camera's low-resolution copy beside an Insta360 `.insv`, if it is there: the X5 names a
+/// shot `VID_<date>_<time>_00_<n>.insv` and its copy `LRV_<date>_<time>_01_<n>.lrv`.
+pub fn insta360_lrv(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".insv").or_else(|| name.strip_suffix(".INSV"))?;
+    let rest = stem.strip_prefix("VID_")?;
+    let dir = path.parent()?;
+    let mut bases = vec![format!("LRV_{rest}")];
+    if let Some(i) = rest.rfind("_00_") {
+        bases.insert(0, format!("LRV_{}_01_{}", &rest[..i], &rest[i + 4..]));
+    }
+    bases.iter().flat_map(|b| [format!("{b}.lrv"), format!("{b}.LRV")]).map(|n| dir.join(n)).find(|p| p.is_file())
+}
+
+/// (item, `.lrv` path) for each of `items` that is an `.insv` with its camera copy beside it and
+/// no proxy yet.
+pub(crate) fn insta360_lrv_proxies(s: &Session, items: &[ItemId]) -> Vec<(ItemId, String)> {
+    items
+        .iter()
+        .filter_map(|&i| {
+            let (clip, path, _) = media_path(&s.project, i)?;
+            if clip.proxy.is_some() {
+                return None;
+            }
+            Some((i, insta360_lrv(Path::new(&path))?.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod insta360_tests {
+    use super::*;
+
+    /// An X5 shot's camera copy is found beside it by its name; anything else has none.
+    #[test]
+    fn finds_the_lrv_beside_an_insv() {
+        let d = std::env::temp_dir().join(format!("fc-lrv-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for n in ["VID_20261107_154224_00_023.insv", "LRV_20261107_154224_01_023.lrv", "VID_20261108_101010_00_024.insv", "clip.insv"] {
+            std::fs::write(d.join(n), b"x").unwrap();
+        }
+        assert_eq!(insta360_lrv(&d.join("VID_20261107_154224_00_023.insv")), Some(d.join("LRV_20261107_154224_01_023.lrv")));
+        assert_eq!(insta360_lrv(&d.join("VID_20261108_101010_00_024.insv")), None, "no copy recorded");
+        assert_eq!(insta360_lrv(&d.join("clip.insv")), None);
+        assert_eq!(insta360_lrv(&d.join("LRV_20261107_154224_01_023.lrv")), None);
+        assert_eq!(insta360_lrv(Path::new("")), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

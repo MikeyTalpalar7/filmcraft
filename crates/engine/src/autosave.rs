@@ -279,7 +279,7 @@ impl Default for MediaPrefs {
             write_clip_markers_to_xmp: false,
             enable_xmp_linking: false,
             include_captions_on_import: true,
-            enable_proxies: false,
+            enable_proxies: true,
             allow_duplicate_media: false,
             create_folder_for_imported_projects: false,
             auto_hide_dependent_clips: false,

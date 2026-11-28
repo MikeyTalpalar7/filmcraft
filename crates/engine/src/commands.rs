@@ -1898,6 +1898,13 @@ fn build() -> Vec<CommandSpec> {
                     }
                 }
             }
+            // Insta360: the .lrv the camera records beside an .insv (the same shot, small) becomes
+            // its proxy, for smooth editing; export still reads the .insv
+            for pair in crate::proxies::insta360_lrv_proxies(s, &item_ids) {
+                if let Err(e) = crate::proxies::attach(s, &[pair], false) {
+                    errors.push(format!("proxy: {e}"));
+                }
+            }
             let ingest = match crate::proxies::ingest(s, &item_ids) {
                 Ok(v) => v,
                 Err(e) => {
