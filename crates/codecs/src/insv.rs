@@ -192,27 +192,90 @@ fn front_weight(tf: f64, tb: f64) -> f64 {
 
 /// One plane of the stitched equirectangular picture, `ow`×`oh`, from the matching planes of the
 /// two lenses.
+#[cfg(test)]
 fn stitch_plane(rig: &Rig, front: Plane, back: Plane, ow: usize, oh: usize) -> Vec<u8> {
+    let map = StitchMap::new(rig, (front.x0, front.size), (back.x0, back.size), ow, oh);
+    stitch_with(&map, front, back)
+}
+
+/// Largest grid step (output pixels) of a [`StitchMap`].
+const GRID: usize = 8;
+
+/// The grid step for a stitched plane `ow` pixels round: at most half a degree of the sphere per
+/// cell (well inside the lenses' blend band), so 8 pixels at 5.7K, 1 (exact) for small pictures.
+fn grid_step(ow: usize) -> usize {
+    (ow / 720).clamp(1, GRID)
+}
+
+/// Where a stitched plane reads the two lenses, worked out once per clip and plane size (the
+/// lenses don't move): for every [`grid_step`]th output pixel across and down, the front and back lens
+/// positions and the front lens's blend weight. The pixels between take the bilinear mix of the
+/// four around them; the mapping is smooth, so this matches working each pixel out to within a
+/// grey level, without the trigonometry per pixel that was most of an export.
+pub(crate) struct StitchMap {
+    ow: usize,
+    oh: usize,
+    step: usize,
+    gw: usize,
+    /// (front x, front y, back x, back y, front weight) per grid point, row by row.
+    nodes: Vec<[f32; 5]>,
+    /// The lens geometry it was made for: (front x0, front size, back x0, back size).
+    lenses: [f64; 4],
+}
+
+impl StitchMap {
+    fn new(rig: &Rig, (fx0, fsize): (f64, f64), (bx0, bsize): (f64, f64), ow: usize, oh: usize) -> Self {
+        let step = grid_step(ow);
+        let (gw, gh) = (ow.saturating_sub(1) / step + 2, oh.saturating_sub(1) / step + 2);
+        let cal = rig.cal;
+        let mut nodes = vec![[0f32; 5]; if ow == 0 || oh == 0 { 0 } else { gw * gh }];
+        nodes.par_chunks_mut(gw.max(1)).enumerate().for_each(|(gj, row)| {
+            let y = (gj * step) as f64;
+            let lat = std::f64::consts::FRAC_PI_2 - (y + 0.5) / oh.max(1) as f64 * std::f64::consts::PI;
+            let (sl, cl) = lat.sin_cos();
+            for (gi, node) in row.iter_mut().enumerate() {
+                let x = (gi * step) as f64;
+                let (so, co) = ((x + 0.5) / ow.max(1) as f64 * std::f64::consts::TAU - std::f64::consts::PI).sin_cos();
+                let d = [cl * so, sl, cl * co];
+                let (fx, fy, tf) = lens_point(&cal.front, cal.canvas, fsize, fx0, d);
+                let (bx, by, tb) = lens_point(&cal.back, cal.canvas, bsize, bx0, rig.in_back(d));
+                *node = [fx as f32, fy as f32, bx as f32, by as f32, front_weight(tf, tb) as f32];
+            }
+        });
+        StitchMap { ow, oh, step, gw, nodes, lenses: [fx0, fsize, bx0, bsize] }
+    }
+
+    fn fits(&self, ow: usize, oh: usize, lenses: [f64; 4]) -> bool {
+        self.ow == ow && self.oh == oh && self.lenses == lenses
+    }
+}
+
+/// One plane of the stitched picture, as `map` says to read `front` and `back`.
+fn stitch_with(map: &StitchMap, front: Plane, back: Plane) -> Vec<u8> {
+    let (ow, oh, gw, step) = (map.ow, map.oh, map.gw, map.step.max(1));
     let mut out = vec![0u8; ow.saturating_mul(oh)];
-    if ow == 0 || oh == 0 {
+    if ow == 0 || oh == 0 || map.nodes.len() < gw * (oh.saturating_sub(1) / step + 2) {
         return out;
     }
-    let cal = rig.cal;
-    let cols: Vec<(f64, f64)> = (0..ow).map(|i| ((i as f64 + 0.5) / ow as f64 * std::f64::consts::TAU - std::f64::consts::PI).sin_cos()).collect();
-    out.par_chunks_mut(ow).enumerate().for_each(|(j, row)| {
-        let lat = std::f64::consts::FRAC_PI_2 - (j as f64 + 0.5) / oh as f64 * std::f64::consts::PI;
-        let (sl, cl) = lat.sin_cos();
-        for (px, &(so, co)) in row.iter_mut().zip(&cols) {
-            let d = [cl * so, sl, cl * co];
-            let (fx, fy, tf) = lens_point(&cal.front, cal.canvas, front.size, front.x0, d);
-            let (bx, by, tb) = lens_point(&cal.back, cal.canvas, back.size, back.x0, rig.in_back(d));
-            let w = front_weight(tf, tb);
-            let v = match w {
-                w if w >= 1.0 => front.sample(fx, fy),
-                w if w <= 0.0 => back.sample(bx, by),
-                w => front.sample(fx, fy) * w + back.sample(bx, by) * (1.0 - w),
+    let inv = 1.0 / step as f32;
+    out.par_chunks_mut(ow).enumerate().for_each(|(y, row)| {
+        let (gj, ty) = (y / step, (y % step) as f32 * inv);
+        let (top, bot) = (&map.nodes[gj * gw..(gj + 1) * gw], &map.nodes[(gj + 1) * gw..(gj + 2) * gw]);
+        for (x, px) in row.iter_mut().enumerate() {
+            let (gi, tx) = (x / step, (x % step) as f32 * inv);
+            let (a, b, c, d) = (top[gi], top[gi + 1], bot[gi], bot[gi + 1]);
+            let v: [f64; 5] = std::array::from_fn(|k| {
+                let t = a[k] + (b[k] - a[k]) * tx;
+                let u = c[k] + (d[k] - c[k]) * tx;
+                f64::from(t + (u - t) * ty)
+            });
+            let w = v[4];
+            let s = match w {
+                w if w >= 1.0 => front.sample(v[0], v[1]),
+                w if w <= 0.0 => back.sample(v[2], v[3]),
+                w => front.sample(v[0], v[1]) * w + back.sample(v[2], v[3]) * (1.0 - w),
             };
-            *px = v.round().clamp(0.0, 255.0) as u8;
+            *px = s.round().clamp(0.0, 255.0) as u8;
         }
     });
     out
@@ -305,6 +368,8 @@ pub struct InsvSource {
     rig: Mutex<Option<Rig>>,
     /// The last stitched frame: (time, height, frame).
     last: Mutex<Option<(Tick, u32, Arc<VideoFrame>)>>,
+    /// Stitch maps of the plane sizes in use (luma and chroma, at the sizes asked for).
+    maps: Mutex<Vec<Arc<StitchMap>>>,
 }
 
 /// Whether `name` is an Insta360 clip by its extension.
@@ -352,7 +417,7 @@ impl InsvSource {
             v.codec = format!("{} · Insta360 dual fisheye", v.codec);
             v.spherical = Some(Spherical { projection: Projection::Equirectangular, stereo: StereoLayout::Mono, ..Default::default() });
         }
-        Ok(InsvSource { info, lenses, cal, rig: Mutex::new(None), last: Mutex::new(None) })
+        Ok(InsvSource { info, lenses, cal, rig: Mutex::new(None), last: Mutex::new(None), maps: Mutex::new(Vec::new()) })
     }
 
     /// The two lens pictures at `req` (front, back), and where each lens sits in its picture.
@@ -369,6 +434,21 @@ impl InsvSource {
                 [(f.clone(), 0.0, size), (f, size, size)]
             }
         })
+    }
+
+    /// The stitch map for a plane `pw`×`ph` read from lenses at `lenses` (made and kept on first use;
+    /// a few sizes at most: luma and chroma, at the resolutions asked for).
+    fn map(&self, rig: &Rig, lenses: [f64; 4], pw: usize, ph: usize) -> Arc<StitchMap> {
+        let mut maps = self.maps.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(m) = maps.iter().find(|m| m.fits(pw, ph, lenses)) {
+            return m.clone();
+        }
+        let m = Arc::new(StitchMap::new(rig, (lenses[0], lenses[1]), (lenses[2], lenses[3]), pw, ph));
+        if maps.len() >= 6 {
+            maps.remove(0);
+        }
+        maps.push(m.clone());
+        m
     }
 
     fn stitch(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
@@ -432,13 +512,8 @@ impl InsvSource {
                 match (fp.get(k), bp.get(k)) {
                     (Some(a), Some(b)) => {
                         let (a, b) = (view(a, fx0, fsize), view(b, bx0, bsize));
-                        stitch_plane(
-                            &rig,
-                            Plane { px: &a.0, w: a.1, h: a.2, x0: a.3, size: a.4 },
-                            Plane { px: &b.0, w: b.1, h: b.2, x0: b.3, size: b.4 },
-                            pw,
-                            ph,
-                        )
+                        let map = self.map(&rig, [a.3, a.4, b.3, b.4], pw, ph);
+                        stitch_with(&map, Plane { px: &a.0, w: a.1, h: a.2, x0: a.3, size: a.4 }, Plane { px: &b.0, w: b.1, h: b.2, x0: b.3, size: b.4 })
                     }
                     _ => vec![0; pw * ph],
                 }

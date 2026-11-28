@@ -138,3 +138,40 @@ fn stitches_a_real_clip() {
         std::fs::write(out, ppm).unwrap();
     }
 }
+
+/// The cached grid stitch matches working out every pixel exactly (within a grey level), at the
+/// sizes a 5.7K clip is stitched to, on a picture with detail everywhere and both lenses blended.
+#[test]
+fn the_stitch_map_matches_the_exact_stitch() {
+    let (size, cal) = (512usize, Calibration::nominal());
+    let rig = Rig::new(cal, [1.0, -0.5, 0.3]);
+    let tex = |seed: u32| -> &'static [u8] {
+        (0..size * size).map(|i| (((i as u32).wrapping_mul(2654435761) ^ seed) >> 7) as u8 / 2 + ((i % size) / 4) as u8).collect::<Vec<u8>>().leak()
+    };
+    let (f, b) = (tex(1), tex(2));
+    let plane = |px: &'static [u8]| Plane { px, w: size, h: size, x0: 0.0, size: size as f64 };
+    for ow in [5760usize, 2880, 1440] {
+        let oh = ow / 2;
+        let exact = {
+            let mut out = vec![0u8; ow * oh];
+            for (j, row) in out.chunks_mut(ow).enumerate() {
+                let lat = std::f64::consts::FRAC_PI_2 - (j as f64 + 0.5) / oh as f64 * std::f64::consts::PI;
+                let (sl, cl) = lat.sin_cos();
+                for (i, px) in row.iter_mut().enumerate() {
+                    let (so, co) = ((i as f64 + 0.5) / ow as f64 * std::f64::consts::TAU - std::f64::consts::PI).sin_cos();
+                    let d = [cl * so, sl, cl * co];
+                    let (fx, fy, tf) = lens_point(&cal.front, cal.canvas, size as f64, 0.0, d);
+                    let (bx, by, tb) = lens_point(&cal.back, cal.canvas, size as f64, 0.0, rig.in_back(d));
+                    let w = front_weight(tf, tb);
+                    let v = plane(f).sample(fx, fy) * w + plane(b).sample(bx, by) * (1.0 - w);
+                    *px = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            out
+        };
+        let fast = stitch_plane(&rig, plane(f), plane(b), ow, oh);
+        let diffs: Vec<u8> = exact.iter().zip(&fast).map(|(a, b)| a.abs_diff(*b)).collect();
+        let mean = diffs.iter().map(|&d| f64::from(d)).sum::<f64>() / diffs.len() as f64;
+        assert!(mean < 0.5, "{ow}: mean difference {mean}");
+    }
+}
